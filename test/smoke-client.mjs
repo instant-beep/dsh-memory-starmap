@@ -274,6 +274,15 @@ if (map.path !== undefined && map.path.length < 1) throw new Error('trace produc
 map.select(undefined)
 console.log('path cleared:', map.path === undefined)
 
+// card payload exposes addressable conversation ids for navigation
+const docStar = map.nodes.find((node) => node.kind === 'document')
+const exposed = map.exposeNode(docStar)
+const sessionNeighbours = exposed.relations.filter((relation) => relation.nodeKind === 'session')
+console.log('doc card relations:', exposed.relations.length, '| with sessionId:', sessionNeighbours.filter((r) => typeof r.sessionId === 'string').length, '| relatedSessionId:', typeof exposed.relatedSessionId)
+if (sessionNeighbours.length > 0 && exposed.relatedSessionId === undefined) throw new Error('document star cannot reach its conversation')
+const sessionStar = map.nodes.find((node) => node.kind === 'session' && typeof node.meta?.sessionId === 'string')
+console.log('session star addressable:', sessionStar === undefined ? 'none' : sessionStar.meta.sessionId.slice(0, 8))
+
 // focus + selection path used by the card
 map.select(sample)
 console.log('highlight size:', map.highlight.size, '| degree:', map.degree.get(sample.id))

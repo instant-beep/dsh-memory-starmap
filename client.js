@@ -84,6 +84,9 @@ window.__ModuleLoader__.load({
       'session.live': '未归档的对话（还没有沉淀成记忆）',
       'legend.live': '未归档对话',
       'detail.openSession': '打开对话',
+      'detail.openSourceSession': '打开最近对话',
+      'detail.openFailed': '这个对话打不开了',
+      'stage.openHint': '点任意一个紫色会话星，卡片里可「打开对话」跳回那段对话',
       'detail.pathLength': '最短关联路径',
       'detail.pathHint': 'Shift + 点击另一颗星，看两者的最短关联链',
       'legend.trace': 'Shift+点击追路径',
@@ -147,6 +150,9 @@ window.__ModuleLoader__.load({
       'session.live': 'Unarchived conversation (no memory written yet)',
       'legend.live': 'unarchived',
       'detail.openSession': 'Open conversation',
+      'detail.openSourceSession': 'Open newest conversation',
+      'detail.openFailed': 'This conversation cannot be opened',
+      'stage.openHint': 'Pick a purple session star — its card can jump back into that conversation',
       'detail.pathLength': 'Shortest path',
       'detail.pathHint': 'Shift-click another star to trace the shortest chain',
       'legend.trace': 'Shift-click to trace',
@@ -1684,10 +1690,22 @@ window.__ModuleLoader__.load({
         },
         relations: (map?.adjacency?.get(node.id) ?? []).map((edge) => {
           const other = edge.source.id === node.id ? edge.target : edge.source
-          return { id: other.id, kind: edge.kind, label: other.label, nodeKind: other.kind }
+          return {
+            id: other.id,
+            kind: edge.kind,
+            label: other.label,
+            nodeKind: other.kind,
+            sessionId: typeof other.meta?.sessionId === 'string' ? other.meta.sessionId : undefined,
+            live: other.meta?.live === true,
+          }
         }),
         degree: map?.degree?.get(node.id) ?? 0,
         pathLength: map?.path?.length,
+        relatedSessionId: (map?.adjacency?.get(node.id) ?? [])
+          .map((edge) => (edge.source.id === node.id ? edge.target : edge.source))
+          .filter((other) => other.kind === 'session' && typeof other.meta?.sessionId === 'string')
+          .sort((a, b) => String(b.ts ?? '').localeCompare(String(a.ts ?? '')))
+          .map((other) => other.meta.sessionId)[0],
       }
     }
 
@@ -1812,6 +1830,9 @@ window.__ModuleLoader__.load({
   padding:6px 10px; border-radius:10px; background: rgba(8,12,22,.6);
   border:1px solid var(--dsw-alias-border-l1); backdrop-filter: blur(8px); }
 .dsh-msm-play { height:26px; padding:0 10px; font-size:11.5px; }
+.dsh-msm-btn.dsh-msm-primary { border-color: rgba(126,227,255,.55); color:#dff4ff;
+  background: rgba(80,170,255,.14); }
+.dsh-msm-btn.dsh-msm-primary:hover { background: rgba(80,170,255,.24); }
 .dsh-msm-range { flex:1 1 auto; min-width:80px; height:3px; appearance:none; border-radius:2px; outline:none;
   background: linear-gradient(90deg, rgba(126,227,255,.55), rgba(255,158,210,.4)); }
 .dsh-msm-range::-webkit-slider-thumb { appearance:none; width:11px; height:11px; border-radius:50%;
@@ -1891,6 +1912,7 @@ window.__ModuleLoader__.load({
       const [searchHit, setSearchHit] = React.useState(undefined)
       const [sessionTick, setSessionTick] = React.useState(0)
       const [clock, setClock] = React.useState({ playhead: 1, playing: false, date: undefined })
+      const [navigateError, setNavigateError] = React.useState(undefined)
       const servicesRef = React.useRef(services)
       servicesRef.current = services
 
@@ -2103,6 +2125,7 @@ window.__ModuleLoader__.load({
           detail === undefined ? null : h(StarCard, {
             key: 'card',
             detail,
+            navigateError,
             onFocus: (id) => {
               const map = mapRef.current
               const target = map?.byId.get(id)
@@ -2112,7 +2135,10 @@ window.__ModuleLoader__.load({
                 setSelection(map.exposeNode(target))
               }
             },
-            onOpenSession: (sessionId) => servicesRef.current?.openSession?.(sessionId),
+            onOpenSession: (sessionId) => {
+              const problem = servicesRef.current?.openSession?.(sessionId)
+              setNavigateError(problem === undefined ? undefined : String(problem))
+            },
             onClose: () => {
               mapRef.current?.select(undefined)
               setSelection(undefined)
@@ -2177,7 +2203,7 @@ window.__ModuleLoader__.load({
           : null)
     }
 
-    function StarCard({ detail, onFocus, onClose, onOpenSession }) {
+    function StarCard({ detail, onFocus, onClose, onOpenSession, navigateError }) {
       const { node, relations, degree } = detail
       const colour = KIND_STYLE[node.kind]?.ring ?? '#9fb6ff'
       const meta = node.meta ?? {}
@@ -2207,14 +2233,27 @@ window.__ModuleLoader__.load({
           h('ul', { className: 'dsh-msm-rel' },
             relations.slice(0, 40).map((relation) =>
               h('li', { key: relation.id + relation.kind },
-                h('button', { type: 'button', onClick: () => onFocus(relation.id) },
+                h('button', {
+                  type: 'button',
+                  title: typeof relation.sessionId === 'string' ? t('detail.openSession') : undefined,
+                  onClick: () => {
+                    if (typeof relation.sessionId === 'string' && relation.nodeKind === 'session' && onOpenSession !== undefined) onOpenSession(relation.sessionId)
+                    else onFocus(relation.id)
+                  },
+                },
                   h('i', { className: 'dsh-msm-dot', style: { background: KIND_STYLE[relation.nodeKind]?.ring ?? '#9fb6ff', color: KIND_STYLE[relation.nodeKind]?.ring ?? '#9fb6ff' } }),
                   h('span', null, relation.label),
-                  h('em', null, relation.kind)))))),
+                  h('em', null, relation.nodeKind === 'session' && typeof relation.sessionId === 'string' ? t('detail.openSession') : relation.kind)))))),
+        navigateError === undefined ? null : h('p', {
+          style: { fontSize: 11.5, color: '#ff9dbc', margin: '6px 0 0' },
+        }, `${t('detail.openFailed')} · ${navigateError}`),
         h('div', { style: { display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' } },
           h('button', { className: 'dsh-msm-btn', type: 'button', onClick: () => onFocus(node.id) }, t('detail.open')),
           node.kind === 'session' && typeof meta.sessionId === 'string' && onOpenSession !== undefined
-            ? h('button', { className: 'dsh-msm-btn', type: 'button', onClick: () => onOpenSession(meta.sessionId) }, t('detail.openSession'))
+            ? h('button', { className: 'dsh-msm-btn dsh-msm-primary', type: 'button', onClick: () => onOpenSession(meta.sessionId) }, t('detail.openSession'))
+            : null,
+          node.kind === 'document' && typeof detail.relatedSessionId === 'string' && onOpenSession !== undefined
+            ? h('button', { className: 'dsh-msm-btn dsh-msm-primary', type: 'button', onClick: () => onOpenSession(detail.relatedSessionId) }, t('detail.openSourceSession'))
             : null,
           h('button', { className: 'dsh-msm-btn', type: 'button', onClick: onClose }, t('action.clear'))))
     }
@@ -2256,15 +2295,24 @@ window.__ModuleLoader__.load({
             }
           },
           openSession(sessionId) {
+            if (typeof sessionId !== 'string' || sessionId === '') return 'no-session'
+            // uiWorkspace.openSession keeps the session retained, selects it in the
+            // session controller and returns the main view to the default panel,
+            // which is the conversation. Switching the panel ourselves would fight it.
             try {
-              ctx.get('uiWorkspace', false)?.openSession?.(sessionId)
-            } catch {
-              /* navigation unavailable: the star stays a read-only record */
-            }
-            try {
-              ctx.layout.selectPanel('conversation')
-            } catch {
-              /* no layout service: nothing else to do */
+              const workspace = ctx.get('uiWorkspace')
+              if (workspace === undefined || typeof workspace.openSession !== 'function') return 'no-service'
+              workspace.openSession(sessionId)
+              return undefined
+            } catch (reason) {
+              // A retired session cannot be revealed; leave the panel where it is.
+              ctx.logger?.warn?.('memory-starmap: openSession failed', reason)
+              try {
+                ctx.layout?.selectPanel?.(null)
+              } catch {
+                /* layout is optional */
+              }
+              return reason instanceof Error ? reason.message : 'failed'
             }
           },
         }
