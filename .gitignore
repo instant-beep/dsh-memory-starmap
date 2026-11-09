@@ -1,0 +1,18 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# local capture of the graph route — contains personal memory titles/paths
+test/fixture-graph.json
+
+# logs & temp
+*.log
+*.tmp
+dist/
+.cache/
+
+# editors & OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

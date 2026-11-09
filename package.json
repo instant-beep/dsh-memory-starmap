@@ -1,0 +1,50 @@
+{
+  "name": "@local/dsh-memory-starmap",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Memory constellation view over the DSH memory system: documents, sessions, source files, runtime memory and skills rendered as one interactive 3D star map.",
+  "license": "MIT",
+  "author": "instant-beep",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/instant-beep/dsh-memory-starmap.git"
+  },
+  "homepage": "https://github.com/instant-beep/dsh-memory-starmap#readme",
+  "bugs": {
+    "url": "https://github.com/instant-beep/dsh-memory-starmap/issues"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis-plugin",
+    "memory",
+    "star-map",
+    "graph-visualization",
+    "3d",
+    "canvas"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-layout"
+      ]
+    }
+  }
+}

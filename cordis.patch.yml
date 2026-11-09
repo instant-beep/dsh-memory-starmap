@@ -1,0 +1,6 @@
+# Bundle patch for the memory constellation view.
+# The Host row serves `/api/dsh-memory-starmap/graph`; the Client half renders
+# the star map as its own sidebar panel.
+- insert:
+    - id: memory-starmap
+      name: '@local/dsh-memory-starmap'
