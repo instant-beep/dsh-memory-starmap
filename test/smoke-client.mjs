@@ -48,16 +48,25 @@ const React = { createElement, useState, useEffect, useRef, useMemo, Fragment: '
 
 // ---------------------------------------------------------------- fake dom
 const created = []
+const callCounts = new Map()
+const counting = process.env.STARMAP_BENCH === '1'
+function bump(name) {
+  callCounts.set(name, (callCounts.get(name) ?? 0) + 1)
+}
 function makeContext() {
   const noop = () => {}
+  const track = (name) => (counting ? () => { bump(name) } : noop)
+  const heavyGradient = (name) => (counting ? () => { bump(name); return gradient } : () => gradient)
   const gradient = { addColorStop: noop }
   return {
     canvas: undefined,
     setTransform: noop, clearRect: noop, fillRect: noop, beginPath: noop, closePath: noop,
-    arc: noop, fill: noop, stroke: noop, moveTo: noop, lineTo: noop, quadraticCurveTo: noop, rect: noop, roundRect: noop, setLineDash: noop, ellipse: noop, createPattern: () => null, measureText: () => ({ width: 120 }),
-    bezierCurveTo: noop, fillText: noop, drawImage: noop, save: noop, restore: noop,
+    arc: track('arc'), fill: track('fill'), stroke: track('stroke'), moveTo: track('moveTo'), lineTo: track('lineTo'),
+    quadraticCurveTo: track('quadraticCurveTo'), rect: noop, roundRect: noop, setLineDash: noop, ellipse: noop,
+    createPattern: () => null, measureText: () => ({ width: 120 }),
+    bezierCurveTo: noop, fillText: track('fillText'), drawImage: track('drawImage'), save: noop, restore: noop,
     translate: noop, scale: noop, rotate: noop,
-    createLinearGradient: () => gradient, createRadialGradient: () => gradient,
+    createLinearGradient: heavyGradient('createLinearGradient'), createRadialGradient: heavyGradient('createRadialGradient'),
     textAlign: 'start', textBaseline: 'alphabetic', font: '', fillStyle: '', strokeStyle: '',
     lineWidth: 1, lineCap: 'butt', globalAlpha: 1,
   }
@@ -362,6 +371,33 @@ map.onWheel({ preventDefault: () => {}, offsetX: 600, offsetY: 400, deltaY: -220
 flush(20)
 console.log('camera after orbit/zoom: yaw', map.view.yaw.toFixed(2), 'pitch', map.view.pitch.toFixed(2), 'dist', Math.round(map.view.dist))
 console.log('projection sanity:', JSON.stringify(map.view.project(0, 0, 0, 1280, 760)), 'near', JSON.stringify(map.view.project(0, 0, 800, 1280, 760)))
+// ---- frame budget -------------------------------------------------------
+// Costs that used to be per-frame work. Gradients must be zero: the sky and every
+// glow are baked once, so a frame is only blits plus path strokes.
+if (counting) {
+  for (const name of callCounts.keys()) callCounts.set(name, 0)
+  const before = process.memoryUsage().heapUsed
+  const started = process.hrtime.bigint()
+  const FRAMES = 240
+  const frameTimes = []
+  for (let step = 0; step < FRAMES; step += 1) {
+    const mark = process.hrtime.bigint()
+    flush(1)
+    frameTimes.push(Number(process.hrtime.bigint() - mark) / 1e6)
+  }
+  const total = Number(process.hrtime.bigint() - started) / 1e6
+  const heapGrowth = (process.memoryUsage().heapUsed - before) / 1024
+  frameTimes.sort((a, b) => a - b)
+  const per = (name) => ((callCounts.get(name) ?? 0) / FRAMES).toFixed(2)
+  console.log('')
+  console.log(`frame budget over ${FRAMES} frames: ${(total / FRAMES).toFixed(2)}ms/frame js, p95 ${frameTimes[Math.floor(FRAMES * 0.95)].toFixed(2)}ms`)
+  console.log(`per frame: drawImage=${per('drawImage')} arc=${per('arc')} stroke=${per('stroke')} fillText=${per('fillText')}`)
+  console.log(`per frame: createRadialGradient=${per('createRadialGradient')} createLinearGradient=${per('createLinearGradient')}`)
+  console.log(`heap growth over run: ${heapGrowth.toFixed(0)}KB`)
+  if ((callCounts.get('createRadialGradient') ?? 0) / FRAMES > 0.5) throw new Error('radial gradients are still built per frame')
+  if ((callCounts.get('createLinearGradient') ?? 0) / FRAMES > 0.5) throw new Error('linear gradients are still built per frame')
+}
+
 map.dispose()
 for (const cleanup of state.ended.splice(0)) {
   if (typeof cleanup === 'function') cleanup()

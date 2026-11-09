@@ -290,11 +290,20 @@ window.__ModuleLoader__.load({
         }
       }
 
+      /** Cache the rotation basis once per frame; every projection reuses it. */
+      sync() {
+        this.cy = Math.cos(this.yaw)
+        this.sy = Math.sin(this.yaw)
+        this.cp = Math.cos(this.pitch)
+        this.sp = Math.sin(this.pitch)
+        return this
+      }
+
       project(x, y, z, width, height) {
-        const cy = Math.cos(this.yaw)
-        const sy = Math.sin(this.yaw)
-        const cp = Math.cos(this.pitch)
-        const sp = Math.sin(this.pitch)
+        const cy = this.cy ?? Math.cos(this.yaw)
+        const sy = this.sy ?? Math.sin(this.yaw)
+        const cp = this.cp ?? Math.cos(this.pitch)
+        const sp = this.sp ?? Math.sin(this.pitch)
         const dx = x - this.focus.x
         const dy = y - this.focus.y
         const dz = z - this.focus.z
@@ -306,6 +315,33 @@ window.__ModuleLoader__.load({
         if (depth < 60) return null
         const scale = this.fov / depth
         return { x: width / 2 + x1 * scale, y: height / 2 - y2 * scale, depth, scale }
+      }
+
+      /** Same maths as project(), written into a reusable slot: no allocation. */
+      into(out, x, y, z, width, height) {
+        const cy = this.cy ?? Math.cos(this.yaw)
+        const sy = this.sy ?? Math.sin(this.yaw)
+        const cp = this.cp ?? Math.cos(this.pitch)
+        const sp = this.sp ?? Math.sin(this.pitch)
+        const dx = x - this.focus.x
+        const dy = y - this.focus.y
+        const dz = z - this.focus.z
+        const x1 = dx * cy - dz * sy
+        const z1 = dx * sy + dz * cy
+        const y2 = dy * cp - z1 * sp
+        const z2 = dy * sp + z1 * cp
+        const depth = this.dist - z2
+        if (depth < 60) {
+          out.ok = false
+          return out
+        }
+        const scale = this.fov / depth
+        out.ok = true
+        out.x = width / 2 + x1 * scale
+        out.y = height / 2 - y2 * scale
+        out.depth = depth
+        out.scale = scale
+        return out
       }
     }
 
@@ -357,13 +393,24 @@ window.__ModuleLoader__.load({
         this.pendingSpace = false
 
         this.sprites = new Map()
+        this.glow = new Map()
+        this.spike = undefined
+        this.bg = undefined
         this.starfield = undefined
         this.dust = []
         this.nebulae = []
+        this.edgeBuf = []
+        this.nodeBuf = []
+        this.probe = { ok: false, x: 0, y: 0, depth: 0, scale: 1 }
+        this.dirty = true
+        this.frameCost = 16
+        this.lastPaint = 0
+        this.settled = false
+        this.stepSkip = 0
         this.lastFrame = 0
         this.centroid = { x: 0, y: 0, z: 0 }
         this.frame = undefined
-        this.dpr = Math.min(window.devicePixelRatio || 1, 2)
+        this.dpr = Math.min(window.devicePixelRatio || 1, 1.5)
         this.size = { width: 0, height: 0 }
 
         this.loop = this.loop.bind(this)
@@ -394,7 +441,7 @@ window.__ModuleLoader__.load({
           const height = Math.max(1, Math.round(rect.height))
           if (width === this.size.width && height === this.size.height) return
           this.size = { width, height }
-          this.dpr = Math.min(window.devicePixelRatio || 1, 2)
+          this.dpr = Math.min(window.devicePixelRatio || 1, 1.5)
           this.canvas.width = Math.round(width * this.dpr)
           this.canvas.height = Math.round(height * this.dpr)
           this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0)
@@ -568,6 +615,13 @@ window.__ModuleLoader__.load({
           this.adjacency.get(edge.target.id).push(edge)
         }
         this.degree = new Map(this.nodes.map((node) => [node.id, this.adjacency.get(node.id).length]))
+        // per-edge drawing constants: hashing per frame was pure waste
+        for (const edge of this.edges) {
+          edge.bendFactor = edge.kind === 'semantic' ? 0.24 : edge.kind === 'skill' ? 0.17 : 0.075
+          edge.bendSign = hashCode(String(edge.s) + String(edge.t)) % 2 === 0 ? 1 : -1
+          edge.stroke = EDGE_STYLE[edge.kind] ?? '#7f8fb3'
+          edge.pulsePhase = (hashCode(String(edge.t) + String(edge.s)) % 1000) / 1000
+        }
         const stamps = []
         for (const node of this.nodes) {
           const value = dayOf(node.created) ?? dayOf(node.ts)
@@ -595,6 +649,8 @@ window.__ModuleLoader__.load({
         this.needsFit = true
         this.applyLayout()
         this.fit()
+        this.warmup(110)
+        this.fit()
       }
 
       setLayout(layout) {
@@ -603,6 +659,9 @@ window.__ModuleLoader__.load({
         this.applyLayout()
         this.alpha = 1
         this.needsFit = true
+        // switching views re-heats the physics: settle it before the user sees it
+        this.warmup(52)
+        this.fit()
       }
 
       setRange(days) {
@@ -839,9 +898,12 @@ window.__ModuleLoader__.load({
 
       // -- geometry -------------------------------------------------------
       radiusOf(node) {
+        if (node.r0 !== undefined) return node.r0
         const style = KIND_STYLE[node.kind] ?? KIND_STYLE.document
         const weight = Math.max(1, node.weight ?? 1)
-        return (2.1 + Math.sqrt(weight) * 1.5) * style.r
+        const value = (2.1 + Math.sqrt(weight) * 1.5) * style.r
+        node.r0 = value
+        return value
       }
 
       /** Filters that only affect drawing: layer toggles, recency window, timeline replay. */
@@ -912,16 +974,50 @@ window.__ModuleLoader__.load({
       }
 
       // -- simulation -----------------------------------------------------
+      /**
+       * Run the physics without painting. Entering the panel used to cost ~13s of
+       * visible jitter while the layout cooled down; this spends that up front in
+       * a few dozen milliseconds instead.
+       */
+      warmup(iterations) {
+        const saved = this.alpha
+        this.warming = true
+        this.alpha = Math.max(saved, 0.9)
+        for (let index = 0; index < iterations; index += 1) {
+          this.step()
+          this.alpha = Math.max(0.02, this.alpha * 0.965)
+        }
+        this.warming = false
+        this.alpha = Math.min(saved, 0.09)
+        this.stepSkip = 0
+        this.bg = undefined
+        this.dirty = true
+      }
+
       step() {
         if (this.alpha < 0.004) return
+        // a warm layout settles so slowly that every other frame is indistinguishable
+        if (this.alpha < 0.35 && this.warming !== true) {
+          this.stepSkip = (this.stepSkip + 1) % 2
+          if (this.stepSkip === 1) return
+        }
         const nodes = this.nodes
-        if (nodes.length === 0) return
+        const count = nodes.length
+        if (count === 0) return
         const alpha = this.alpha
         const cell = 210
-        const buckets = new Map()
+
+        // one visibility pass per frame instead of one per neighbour probe
+        for (const node of nodes) node.sv = this.simVisible(node) ? 1 : 0
+
+        // integer cell keys and reused buckets: no string building, no allocation
+        const buckets = this.cellBuckets ?? (this.cellBuckets = new Map())
+        for (const list of buckets.values()) list.length = 0
         for (const node of nodes) {
-          if (!this.simVisible(node)) continue
-          const key = `${Math.floor(node.x / cell)}:${Math.floor(node.y / cell)}:${Math.floor(node.z / cell)}`
+          if (node.sv === 0) continue
+          const key = (Math.floor(node.x / cell) + 512) * 1048576
+            + (Math.floor(node.y / cell) + 512) * 1024
+            + (Math.floor(node.z / cell) + 512)
           let bucket = buckets.get(key)
           if (bucket === undefined) {
             bucket = []
@@ -929,18 +1025,20 @@ window.__ModuleLoader__.load({
           }
           bucket.push(node)
         }
+
         const repulsion = 13000 * alpha
         for (const node of nodes) {
-          if (!this.simVisible(node)) continue
-          const gx = Math.floor(node.x / cell)
-          const gy = Math.floor(node.y / cell)
-          const gz = Math.floor(node.z / cell)
+          if (node.sv === 0) continue
+          const gx = Math.floor(node.x / cell) + 512
+          const gy = Math.floor(node.y / cell) + 512
+          const gz = Math.floor(node.z / cell) + 512
           for (let dx = -1; dx <= 1; dx += 1) {
             for (let dy = -1; dy <= 1; dy += 1) {
               for (let dz = -1; dz <= 1; dz += 1) {
-                const bucket = buckets.get(`${gx + dx}:${gy + dy}:${gz + dz}`)
+                const bucket = buckets.get((gx + dx) * 1048576 + (gy + dy) * 1024 + (gz + dz))
                 if (bucket === undefined) continue
-                for (const other of bucket) {
+                for (let index = 0; index < bucket.length; index += 1) {
+                  const other = bucket[index]
                   if (other === node) continue
                   const ax = node.x - other.x
                   const ay = node.y - other.y
@@ -961,7 +1059,7 @@ window.__ModuleLoader__.load({
         for (const edge of this.edges) {
           const { source, target } = edge
           if (source === undefined || target === undefined) continue
-          if (!this.simVisible(source) || !this.simVisible(target)) continue
+          if (source.sv === 0 || target.sv === 0) continue
           const ax = target.x - source.x
           const ay = target.y - source.y
           const az = target.z - source.z
@@ -1138,6 +1236,233 @@ window.__ModuleLoader__.load({
         return canvas
       }
 
+      /** One baked radial glow per colour: building gradients per frame was the old bottleneck. */
+      glowSprite(rgb) {
+        const cached = this.glow.get(rgb)
+        if (cached !== undefined) return cached
+        const size = 128
+        const canvas = document.createElement('canvas')
+        canvas.width = size
+        canvas.height = size
+        const ctx = canvas.getContext('2d')
+        const gradient = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2)
+        gradient.addColorStop(0, 'rgba(' + rgb + ',1)')
+        gradient.addColorStop(0.38, 'rgba(' + rgb + ',0.36)')
+        gradient.addColorStop(0.7, 'rgba(' + rgb + ',0.09)')
+        gradient.addColorStop(1, 'rgba(' + rgb + ',0)')
+        ctx.fillStyle = gradient
+        ctx.fillRect(0, 0, size, size)
+        this.glow.set(rgb, canvas)
+        return canvas
+      }
+
+      /** Baked four-point diffraction spike, drawn scaled instead of rebuilding gradients. */
+      spikeSprite() {
+        if (this.spike !== undefined) return this.spike
+        const size = 256
+        const mid = size / 2
+        const canvas = document.createElement('canvas')
+        canvas.width = size
+        canvas.height = size
+        const ctx = canvas.getContext('2d')
+        ctx.globalCompositeOperation = 'lighter'
+        const draw = (horizontal, peak, width) => {
+          const gradient = horizontal
+            ? ctx.createLinearGradient(0, mid, size, mid)
+            : ctx.createLinearGradient(mid, 0, mid, size)
+          gradient.addColorStop(0, 'rgba(255,255,255,0)')
+          gradient.addColorStop(0.5, 'rgba(255,255,255,' + peak + ')')
+          gradient.addColorStop(1, 'rgba(255,255,255,0)')
+          ctx.strokeStyle = gradient
+          ctx.lineWidth = width
+          ctx.beginPath()
+          if (horizontal) {
+            ctx.moveTo(0, mid)
+            ctx.lineTo(size, mid)
+          } else {
+            ctx.moveTo(mid, 0)
+            ctx.lineTo(mid, size)
+          }
+          ctx.stroke()
+        }
+        draw(true, 0.9, 2)
+        draw(false, 0.62, 1.6)
+        this.spike = canvas
+        return canvas
+      }
+
+      /**
+       * The whole static sky — starfield, dust shell, nebulae, nucleus, accretion
+       * arms and orbital rings — baked at reduced resolution and blitted. It is the
+       * only part that has to be rebuilt when the camera moves.
+       */
+      ensureBackground() {
+        const { width, height } = this.size
+        if (width === 0 || height === 0) return undefined
+        const centre = this.centroid ?? { x: 0, y: 0, z: 0 }
+        const spin = this.time * 0.00016
+        // coarse key on purpose: the sky is all soft glow, so rebuilding it every
+        // five frames only costs time, never visible accuracy
+        const key = [
+          width, height, this.dpr,
+          this.view.yaw.toFixed(2), this.view.pitch.toFixed(2), Math.round(this.view.dist / 12),
+          Math.round(centre.x / 24), Math.round(centre.y / 24), Math.round(centre.z / 24),
+          Math.round(spin * 8),
+        ].join('|')
+        if (this.bg !== undefined && this.bg.key === key) return this.bg.canvas
+
+        const scale = this.drag !== undefined || this.pinch !== undefined ? 0.42 : 0.58
+        const cw = Math.max(1, Math.round(width * scale))
+        const ch = Math.max(1, Math.round(height * scale))
+        let canvas = this.bg?.canvas
+        if (canvas === undefined || canvas.width !== cw || canvas.height !== ch) {
+          canvas = document.createElement('canvas')
+          canvas.width = cw
+          canvas.height = ch
+        }
+        const ctx = canvas.getContext('2d')
+        ctx.setTransform(1, 0, 0, 1, 0, 0)
+        ctx.clearRect(0, 0, cw, ch)
+        const sx = cw / width
+        const sy = ch / height
+        const project = (x, y, z) => {
+          const point = this.view.project(x, y, z, width, height)
+          if (point === null) return null
+          return { x: point.x * sx, y: point.y * sy, depth: point.depth, scale: point.scale * scale }
+        }
+        const dist = this.view.dist
+
+        if (this.starfield !== undefined) ctx.drawImage(this.starfield, 0, 0, cw, ch)
+        ctx.globalCompositeOperation = 'lighter'
+
+        // 3D dust shell: parallax for free once the camera rotates
+        const dustSprite = this.glowSprite('232,242,255')
+        for (const mote of this.dust) {
+          const point = project(mote.x, mote.y, mote.z)
+          if (point === null) continue
+          if (point.x < -20 || point.y < -20 || point.x > cw + 20 || point.y > ch + 20) continue
+          const fog = Math.min(1, Math.max(0, (point.depth - dist * 0.5) / (dist * 1.6)))
+          const alpha = mote.alpha * (1 - fog) * 0.5
+          if (alpha < 0.03) continue
+          ctx.globalAlpha = alpha
+          const size = Math.max(1.4, mote.size * point.scale * 2.4)
+          ctx.drawImage(dustSprite, point.x - size / 2, point.y - size / 2, size, size)
+        }
+        ctx.globalAlpha = 1
+
+        const core = project(centre.x, centre.y, centre.z)
+
+        // galactic disc
+        if (core !== null) {
+          const discRadius = Math.max(120, Math.min(Math.max(cw, ch) * 0.7, (1200 / Math.max(320, dist)) * 520 * scale))
+          const flatten = Math.min(1, Math.max(0.06, Math.abs(Math.sin(this.view.pitch)) + 0.12))
+          ctx.save()
+          ctx.translate(core.x, core.y)
+          ctx.scale(1, flatten)
+          ctx.globalAlpha = 0.5
+          ctx.drawImage(this.glowSprite('110,176,255'), -discRadius, -discRadius, discRadius * 2, discRadius * 2)
+          ctx.restore()
+          ctx.globalAlpha = 1
+        }
+
+        // galactic nucleus
+        if (core !== null) {
+          const nucleusRadius = Math.max(16, 34 * core.scale)
+          const layers = [
+            { scale: 4.2, rgb: '86,150,255', alpha: 0.5 },
+            { scale: 2.1, rgb: '168,206,255', alpha: 0.75 },
+            { scale: 1.0, rgb: '255,248,232', alpha: 1 },
+            { scale: 0.42, rgb: '255,255,255', alpha: 1 },
+          ]
+          for (const layer of layers) {
+            const radius = Math.max(5, nucleusRadius * layer.scale)
+            ctx.globalAlpha = layer.alpha * 0.6
+            ctx.drawImage(this.glowSprite(layer.rgb), core.x - radius, core.y - radius, radius * 2, radius * 2)
+          }
+          ctx.globalAlpha = 1
+          const flatten = Math.min(1, Math.max(0.08, Math.abs(Math.sin(this.view.pitch)) + 0.1))
+          ctx.lineWidth = 0.8
+          for (let arm = 0; arm < 10; arm += 1) {
+            const offset = (arm / 10) * Math.PI * 2
+            ctx.beginPath()
+            let started = false
+            for (let segment = 0; segment <= 12; segment += 1) {
+              const t = segment / 12
+              const angle = offset + spin + t * 2.4
+              const radius = nucleusRadius * (1.1 + t * 5.4)
+              const point = project(
+                centre.x + Math.cos(angle) * radius,
+                centre.y + Math.sin(angle) * radius * flatten * 0.55,
+                centre.z + Math.sin(angle) * radius,
+              )
+              if (point === null) {
+                started = false
+                continue
+              }
+              if (!started) {
+                ctx.moveTo(point.x, point.y)
+                started = true
+              } else {
+                ctx.lineTo(point.x, point.y)
+              }
+            }
+            ctx.strokeStyle = 'rgba(150,196,255,' + (0.09 - 0.005 * arm).toFixed(3) + ')'
+            ctx.stroke()
+          }
+        }
+
+        // nebulae wrap the real document clusters
+        for (const cloud of this.nebulae) {
+          const point = project(cloud.x, cloud.y, cloud.z)
+          if (point === null) continue
+          const radius = Math.max(30, cloud.r * point.scale)
+          if (point.x + radius < 0 || point.y + radius < 0 || point.x - radius > cw || point.y - radius > ch) continue
+          const fog = Math.min(0.85, Math.max(0, (point.depth - dist * 0.4) / (dist * 1.8)))
+          const alpha = cloud.alpha * (1 - fog) * 1.4
+          if (alpha < 0.01) continue
+          ctx.globalAlpha = Math.min(0.5, alpha)
+          ctx.drawImage(this.glowSprite(cloud.color), point.x - radius, point.y - radius, radius * 2, radius * 2)
+        }
+        ctx.globalAlpha = 1
+
+        // orbital decoration
+        if (core !== null) {
+          ctx.setLineDash([])
+          for (let ring = 0; ring < 3; ring += 1) {
+            const radius = 115 + ring * 96
+            const tilt = 0.22 + ring * 0.13
+            ctx.beginPath()
+            let started = false
+            for (let segment = 0; segment <= 64; segment += 1) {
+              const angle = (segment / 64) * Math.PI * 2
+              const point = project(
+                centre.x + Math.cos(angle) * radius,
+                centre.y + Math.sin(angle) * radius * tilt,
+                centre.z + Math.sin(angle) * radius,
+              )
+              if (point === null) {
+                started = false
+                continue
+              }
+              if (!started) {
+                ctx.moveTo(point.x, point.y)
+                started = true
+              } else {
+                ctx.lineTo(point.x, point.y)
+              }
+            }
+            ctx.strokeStyle = 'rgba(126,196,255,' + (0.1 - ring * 0.022) + ')'
+            ctx.lineWidth = 1
+            ctx.stroke()
+          }
+        }
+
+        ctx.globalCompositeOperation = 'source-over'
+        ctx.globalAlpha = 1
+        this.bg = { canvas, key }
+        return canvas
+      }
+
       loop(timestamp) {
         this.frame = requestAnimationFrame(this.loop)
         if (this.size.width === 0) return
@@ -1165,6 +1490,25 @@ window.__ModuleLoader__.load({
           this.view.yaw += delta * 0.000012
         }
         this.camera.zoom = 1500 / this.view.dist
+        this.view.sync()
+
+        // an idle map still breathes, but there is no reason to burn a full frame
+        // budget on it: painters only run while something is actually moving
+        const moving = this.drag !== undefined
+          || this.pinch !== undefined
+          || this.alpha > 0.004
+          || this.playing
+          || Math.abs(this.spinVelocity.yaw) > 0.00008
+          || Math.abs(this.spinVelocity.pitch) > 0.00008
+          || Math.abs(this.view.target.yaw - this.view.yaw) > 0.0004
+          || Math.abs(this.view.target.pitch - this.view.pitch) > 0.0004
+          || Math.abs(this.view.target.dist - this.view.dist) > 0.4
+          || Math.hypot(this.view.target.focus.x - this.view.focus.x, this.view.target.focus.y - this.view.focus.y, this.view.target.focus.z - this.view.focus.z) > 0.4
+        const breathing = !this.reducedMotion && this.selected === undefined
+        if (!moving && !breathing && !this.dirty && timestamp - this.lastPaint < 120) return
+        if (!moving && !this.dirty && timestamp - this.lastPaint < 42) return
+        this.dirty = false
+        this.lastPaint = timestamp
 
         if (this.playing) {
           this.playhead = Math.min(1, this.playhead + delta / 15000)
@@ -1183,187 +1527,64 @@ window.__ModuleLoader__.load({
         const ctx = this.ctx
         const { width, height } = this.size
         ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0)
-        ctx.clearRect(0, 0, width, height)
-        if (this.starfield !== undefined) ctx.drawImage(this.starfield, 0, 0, width, height)
+        ctx.globalAlpha = 1
+        ctx.globalCompositeOperation = 'source-over'
+
+        // the whole static sky comes from a baked half-resolution layer
+        const sky = this.ensureBackground()
+        if (sky !== undefined) ctx.drawImage(sky, 0, 0, width, height)
+        else ctx.clearRect(0, 0, width, height)
 
         const project = (x, y, z) => this.view.project(x, y, z, width, height)
         const focus = this.selected ?? this.hovered
         const dimmed = focus !== undefined
         const dist = this.view.dist
+        const centre = this.centroid ?? { x: 0, y: 0, z: 0 }
 
         // everything luminous is composited additively, the way a real star field reads
         ctx.globalCompositeOperation = 'lighter'
 
-        // galactic disc glow: an ellipse whose flattening follows the camera pitch
-        const centre = this.centroid ?? { x: 0, y: 0, z: 0 }
-        const core = project(centre.x, centre.y, centre.z)
-        if (core !== null) {
-          const discRadius = Math.max(120, Math.min(Math.max(width, height) * 0.6, (1200 / Math.max(320, dist)) * 520))
-          const flatten = Math.min(1, Math.max(0.06, Math.abs(Math.sin(this.view.pitch)) + 0.12))
-          ctx.save()
-          ctx.translate(core.x, core.y)
-          ctx.scale(1, flatten)
-          const disc = ctx.createRadialGradient(0, 0, 0, 0, 0, discRadius)
-          disc.addColorStop(0, 'rgba(120,190,255,0.12)')
-          disc.addColorStop(0.35, 'rgba(96,150,255,0.07)')
-          disc.addColorStop(0.7, 'rgba(120,96,255,0.035)')
-          disc.addColorStop(1, 'rgba(0,0,0,0)')
-          ctx.fillStyle = disc
-          ctx.beginPath()
-          ctx.arc(0, 0, discRadius, 0, Math.PI * 2)
-          ctx.fill()
-          ctx.restore()
-        }
-
-        // 3D dust
-        for (const mote of this.dust) {
-          const point = project(mote.x, mote.y, mote.z)
-          if (point === null) continue
-          if (point.x < -40 || point.y < -40 || point.x > width + 40 || point.y > height + 40) continue
-          const fog = Math.min(1, Math.max(0, (point.depth - dist * 0.5) / (dist * 1.6)))
-          const alpha = mote.alpha * (1 - fog) * 0.62
-          if (alpha < 0.02) continue
-          ctx.globalAlpha = alpha
-          ctx.fillStyle = mote.hue > 0.82 ? '#ffd7a8' : mote.hue > 0.62 ? '#c9d8ff' : '#e9f3ff'
-          const size = Math.max(1, mote.size * point.scale * 1.7)
-          ctx.fillRect(point.x - size / 2, point.y - size / 2, size, size)
-        }
-        ctx.globalAlpha = 1
-
-        // galactic nucleus: a hot core with rotating accretion arms
-        if (core !== null) {
-          const nucleusRadius = Math.max(18, 34 * core.scale)
-          const layers = [
-            { scale: 4.2, colour: '86,150,255', alpha: 0.055 },
-            { scale: 2.1, colour: '168,206,255', alpha: 0.08 },
-            { scale: 1.0, colour: '255,248,232', alpha: 0.2 },
-            { scale: 0.42, colour: '255,255,255', alpha: 0.5 },
-          ]
-          for (const layer of layers) {
-            const radius = Math.max(6, nucleusRadius * layer.scale)
-            const gradient = ctx.createRadialGradient(core.x, core.y, 0, core.x, core.y, radius)
-            gradient.addColorStop(0, `rgba(${layer.colour},${layer.alpha})`)
-            gradient.addColorStop(0.55, `rgba(${layer.colour},${(layer.alpha * 0.35).toFixed(3)})`)
-            gradient.addColorStop(1, `rgba(${layer.colour},0)`)
-            ctx.fillStyle = gradient
-            ctx.beginPath()
-            ctx.arc(core.x, core.y, radius, 0, Math.PI * 2)
-            ctx.fill()
-          }
-          const spin = this.time * 0.00016
-          const flatten = Math.min(1, Math.max(0.08, Math.abs(Math.sin(this.view.pitch)) + 0.1))
-          ctx.lineWidth = 0.8
-          for (let arm = 0; arm < 10; arm += 1) {
-            const offset = (arm / 10) * Math.PI * 2
-            ctx.beginPath()
-            let started = false
-            for (let segment = 0; segment <= 14; segment += 1) {
-              const t = segment / 14
-              const angle = offset + spin + t * 2.4
-              const radius = nucleusRadius * (1.1 + t * 5.4)
-              const point = project(
-                centre.x + Math.cos(angle) * radius,
-                centre.y + Math.sin(angle) * radius * flatten * 0.55,
-                centre.z + Math.sin(angle) * radius,
-              )
-              if (point === null) {
-                started = false
-                continue
-              }
-              if (!started) {
-                ctx.moveTo(point.x, point.y)
-                started = true
-              } else {
-                ctx.lineTo(point.x, point.y)
-              }
-            }
-            ctx.strokeStyle = `rgba(150,196,255,${(0.075 - 0.004 * arm).toFixed(3)})`
-            ctx.stroke()
-          }
-        }
-
-        // soft nebulae sitting behind the constellation
-        for (const cloud of this.nebulae) {
-          const point = project(cloud.x, cloud.y, cloud.z)
-          if (point === null) continue
-          const radius = Math.max(50, cloud.r * point.scale)
-          if (point.x + radius < 0 || point.y + radius < 0 || point.x - radius > width || point.y - radius > height) continue
-          const fog = Math.min(0.85, Math.max(0, (point.depth - dist * 0.4) / (dist * 1.8)))
-          const alpha = cloud.alpha * (1 - fog)
-          if (alpha < 0.008) continue
-          const gradient = ctx.createRadialGradient(point.x, point.y, 0, point.x, point.y, radius)
-          gradient.addColorStop(0, `rgba(${cloud.color},${alpha.toFixed(3)})`)
-          gradient.addColorStop(0.45, `rgba(${cloud.color},${(alpha * 0.45).toFixed(3)})`)
-          gradient.addColorStop(1, `rgba(${cloud.color},0)`)
-          ctx.fillStyle = gradient
-          ctx.beginPath()
-          ctx.arc(point.x, point.y, radius, 0, Math.PI * 2)
-          ctx.fill()
-        }
-
-        // orbital decoration around the galactic core
-        if (core !== null) {
-          ctx.save()
-          ctx.setLineDash([])
-          for (let ring = 0; ring < 3; ring += 1) {
-            const radius = 115 + ring * 96
-            const tilt = 0.22 + ring * 0.13
-            ctx.beginPath()
-            let started = false
-            for (let segment = 0; segment <= 72; segment += 1) {
-              const angle = (segment / 72) * Math.PI * 2
-              const point = project(
-                centre.x + Math.cos(angle) * radius,
-                centre.y + Math.sin(angle) * radius * tilt,
-                centre.z + Math.sin(angle) * radius,
-              )
-              if (point === null) {
-                started = false
-                continue
-              }
-              if (!started) {
-                ctx.moveTo(point.x, point.y)
-                started = true
-              } else {
-                ctx.lineTo(point.x, point.y)
-              }
-            }
-            ctx.strokeStyle = `rgba(126,196,255,${0.1 - ring * 0.022})`
-            ctx.lineWidth = 1
-            ctx.stroke()
-          }
-          ctx.restore()
-        }
-
-        // edges, far to near
-        const projected = new Map()
+        // project once into numeric fields: no Map, no per-frame objects
+        const probe = this.probe
         for (const node of this.nodes) {
+          node.pv = 0
           if (!this.lodVisible(node)) continue
-          const point = project(node.x, node.y, node.z)
-          if (point !== null) projected.set(node.id, point)
+          this.view.into(probe, node.x, node.y, node.z, width, height)
+          if (!probe.ok) continue
+          node.px = probe.x
+          node.py = probe.y
+          node.pd = probe.depth
+          node.pv = probe.scale
         }
 
-        const visibleEdges = []
+        const visibleEdges = this.edgeBuf
+        visibleEdges.length = 0
         for (const edge of this.edges) {
-          const from = projected.get(edge.source.id)
-          const to = projected.get(edge.target.id)
-          if (from === undefined || to === undefined) continue
-          if (focus !== undefined && edge.source.id !== focus.id && edge.target.id !== focus.id) continue
-          visibleEdges.push({ edge, from, to, depth: (from.depth + to.depth) / 2 })
+          const from = edge.source
+          const to = edge.target
+          if (from.pv === 0 || to.pv === 0) continue
+          if (focus !== undefined && from.id !== focus.id && to.id !== focus.id) continue
+          visibleEdges.push(edge)
         }
-        visibleEdges.sort((a, b) => b.depth - a.depth)
+        visibleEdges.sort((a, b) => b.source.pd + b.target.pd - (a.source.pd + a.target.pd))
 
         ctx.lineCap = 'round'
-        const traceEdge = (item) => {
-          const midX = (item.from.x + item.to.x) / 2
-          const midY = (item.from.y + item.to.y) / 2
-          const dx = item.to.x - item.from.x
-          const dy = item.to.y - item.from.y
-          const length = Math.hypot(dx, dy) + 0.001
-          const bendFactor = item.edge.kind === 'semantic' ? 0.24 : item.edge.kind === 'skill' ? 0.17 : 0.075
-          const bend = Math.min(64, length * bendFactor) * ((hashCode(`${item.edge.s}${item.edge.t}`) % 2 === 0) ? 1 : -1)
-          ctx.moveTo(item.from.x, item.from.y)
-          ctx.quadraticCurveTo(midX - (dy / length) * bend, midY + (dx / length) * bend, item.to.x, item.to.y)
+        const traceEdge = (edge) => {
+          const x1 = edge.source.px
+          const y1 = edge.source.py
+          const x2 = edge.target.px
+          const y2 = edge.target.py
+          const dx = x2 - x1
+          const dy = y2 - y1
+          const length = Math.sqrt(dx * dx + dy * dy) || 1
+          const bend = Math.min(64, length * edge.bendFactor) * edge.bendSign
+          ctx.moveTo(x1, y1)
+          ctx.quadraticCurveTo(
+            (x1 + x2) / 2 - (dy / length) * bend,
+            (y1 + y2) / 2 + (dx / length) * bend,
+            x2,
+            y2,
+          )
         }
 
         if (this.path !== undefined) {
@@ -1372,35 +1593,41 @@ window.__ModuleLoader__.load({
           ctx.lineWidth = 1.9
           ctx.beginPath()
           let any = false
-          for (const item of visibleEdges) {
-            if (!this.path.edges.has(item.edge)) continue
-            traceEdge(item)
+          for (const edge of visibleEdges) {
+            if (!this.path.edges.has(edge)) continue
+            traceEdge(edge)
             any = true
           }
           if (any) ctx.stroke()
         }
 
-        // identical relations share one path per depth band: ~24 strokes instead of ~500
-        const buckets = new Map()
-        for (const item of visibleEdges) {
-          if (this.path !== undefined && this.path.edges.has(item.edge)) continue
-          const fog = Math.min(0.92, Math.max(0, (item.depth - dist * 0.55) / (dist * 1.5)))
+        // relations share one path per kind and depth band: ~24 strokes instead of ~500
+        const buckets = this.buckets ?? (this.buckets = new Map())
+        for (const list of buckets.values()) list.length = 0
+        for (const edge of visibleEdges) {
+          if (this.path !== undefined && this.path.edges.has(edge)) continue
+          const depth = (edge.source.pd + edge.target.pd) / 2
+          const fog = Math.min(0.92, Math.max(0, (depth - dist * 0.55) / (dist * 1.5)))
           const band = Math.min(3, Math.floor(fog * 4))
-          const key = `${item.edge.kind}:${band}`
-          let bucket = buckets.get(key)
-          if (bucket === undefined) {
-            bucket = { kind: item.edge.kind, band, items: [] }
-            buckets.set(key, bucket)
+          const key = edge.kind + ':' + band
+          let list = buckets.get(key)
+          if (list === undefined) {
+            list = []
+            buckets.set(key, list)
           }
-          bucket.items.push(item)
+          list.push(edge)
         }
-        for (const bucket of buckets.values()) {
-          const fog = (bucket.band + 0.35) / 4
+        for (const [key, list] of buckets) {
+          if (list.length === 0) continue
+          const split = key.lastIndexOf(':')
+          const kind = key.slice(0, split)
+          const band = Number(key.slice(split + 1))
+          const fog = (band + 0.35) / 4
           ctx.globalAlpha = Math.max(0.02, (dimmed ? 0.4 : 0.3) * (1 - fog))
-          ctx.strokeStyle = EDGE_STYLE[bucket.kind] ?? '#7f8fb3'
-          ctx.lineWidth = Math.max(0.5, 1.8 - bucket.band * 0.34)
+          ctx.strokeStyle = EDGE_STYLE[kind] ?? '#7f8fb3'
+          ctx.lineWidth = Math.max(0.5, 1.8 - band * 0.34)
           ctx.beginPath()
-          for (const item of bucket.items) traceEdge(item)
+          for (const edge of list) traceEdge(edge)
           ctx.stroke()
         }
         ctx.globalAlpha = 1
@@ -1409,81 +1636,66 @@ window.__ModuleLoader__.load({
         if (focus !== undefined && !this.reducedMotion) {
           const phaseBase = this.time * 0.0004
           ctx.globalAlpha = 0.9
-          for (const item of visibleEdges) {
-            const phase = (phaseBase + (hashCode(item.edge.s + item.edge.t) % 1000) / 1000) % 1
-            const x = item.from.x + (item.to.x - item.from.x) * phase
-            const y = item.from.y + (item.to.y - item.from.y) * phase
-            ctx.fillStyle = EDGE_STYLE[item.edge.kind] ?? '#9fb6ff'
+          for (const edge of visibleEdges) {
+            const phase = (phaseBase + edge.pulsePhase) % 1
+            ctx.fillStyle = edge.stroke
             ctx.beginPath()
-            ctx.arc(x, y, 1.6, 0, Math.PI * 2)
+            ctx.arc(
+              edge.source.px + (edge.target.px - edge.source.px) * phase,
+              edge.source.py + (edge.target.py - edge.source.py) * phase,
+              1.6, 0, Math.PI * 2,
+            )
             ctx.fill()
           }
           ctx.globalAlpha = 1
         }
 
         // stars, far to near
-        const order = [...this.nodes]
-          .filter((node) => projected.has(node.id))
-          .sort((a, b) => projected.get(b.id).depth - projected.get(a.id).depth)
+        const order = this.nodeBuf
+        order.length = 0
+        for (const node of this.nodes) if (node.pv !== 0) order.push(node)
+        order.sort((a, b) => b.pd - a.pd)
 
+        const spike = this.spikeSprite()
         for (const node of order) {
-          const point = projected.get(node.id)
           const style = KIND_STYLE[node.kind] ?? KIND_STYLE.document
-          const base = this.radiusOf(node)
-          const scale = point.scale
-          const radius = Math.max(1.1, Math.min(46, base * scale * 0.85))
-          const fog = Math.min(0.94, Math.max(0, (point.depth - dist * 0.55) / (dist * 1.6)))
+          const scale = node.pv
+          const radius = Math.max(1.1, Math.min(34, this.radiusOf(node) * scale * 0.85))
+          const fog = Math.min(0.94, Math.max(0, (node.pd - dist * 0.55) / (dist * 1.6)))
           const focused = focus === undefined || this.highlight.has(node.id) || node.kind === 'document'
-          const depthWeight = Math.min(1.25, Math.max(0.42, 1400 / point.depth))
+          const depthWeight = Math.min(1.25, Math.max(0.42, 1400 / node.pd))
           const alpha = (focus === undefined ? 0.95 : focused ? 1 : 0.14) * (1 - fog) * depthWeight
           if (alpha < 0.02) continue
           const age = this.playhead - node.born
           const flash = age >= 0 && age < 0.03 ? 1 - age / 0.03 : 0
-          const halo = radius * (node.kind === 'document' ? 5.0 : 4.2) * (1 + flash * 1.1)
+          const halo = radius * (node.kind === 'document' ? 3.7 : 3.2) * (1 + flash * 1.1)
           ctx.globalAlpha = Math.min(0.95, alpha * 0.74 * (1 + flash * 0.5))
-          const warm = point.depth < dist * 0.98
-          ctx.drawImage(this.spriteFor(node.kind, warm), point.x - halo / 2, point.y - halo / 2, halo, halo)
+          const warm = node.pd < dist * 0.98
+          ctx.drawImage(this.spriteFor(node.kind, warm), node.px - halo / 2, node.py - halo / 2, halo, halo)
 
           if (radius > 2.2) {
             ctx.fillStyle = style.core
             ctx.beginPath()
-            ctx.arc(point.x, point.y, Math.max(1, radius * 0.42), 0, Math.PI * 2)
+            ctx.arc(node.px, node.py, Math.max(1, radius * 0.42), 0, Math.PI * 2)
             ctx.fill()
           }
 
           // corona ring on the heaviest stars
-          if ((node.weight ?? 1) > 8 && radius > 4.2) {
+          const weight = node.weight ?? 1
+          if (weight > 8 && radius > 4.2) {
             ctx.globalAlpha = Math.min(0.6, alpha * 0.5)
             ctx.strokeStyle = style.ring
             ctx.lineWidth = 0.8
-            const ringRadius = radius * (2.5 + Math.sin(this.time * 0.0006 + point.x * 0.01) * 0.12)
             ctx.beginPath()
-            ctx.arc(point.x, point.y, ringRadius, 0, Math.PI * 2)
+            ctx.arc(node.px, node.py, radius * (2.5 + Math.sin(this.time * 0.0006 + node.px * 0.01) * 0.12), 0, Math.PI * 2)
             ctx.stroke()
           }
 
-          // diffraction spikes on the brightest stars
-          if ((node.weight ?? 1) > 6.5 && radius > 3.4) {
-            const flare = radius * (4.2 + Math.min(3.4, (node.weight ?? 1) * 0.28))
-            const gradient = ctx.createLinearGradient(point.x - flare, point.y, point.x + flare, point.y)
-            gradient.addColorStop(0, hexToRgba(style.ring, 0))
-            gradient.addColorStop(0.5, hexToRgba(style.core, 0.5 * alpha))
-            gradient.addColorStop(1, hexToRgba(style.ring, 0))
-            ctx.strokeStyle = gradient
-            ctx.lineWidth = 0.9
-            ctx.beginPath()
-            ctx.moveTo(point.x - flare, point.y)
-            ctx.lineTo(point.x + flare, point.y)
-            const vertical = ctx.createLinearGradient(point.x, point.y - flare * 0.75, point.x, point.y + flare * 0.75)
-            vertical.addColorStop(0, hexToRgba(style.ring, 0))
-            vertical.addColorStop(0.5, hexToRgba(style.core, 0.34 * alpha))
-            vertical.addColorStop(1, hexToRgba(style.ring, 0))
-            ctx.stroke()
-            ctx.strokeStyle = vertical
-            ctx.beginPath()
-            ctx.moveTo(point.x, point.y - flare * 0.75)
-            ctx.lineTo(point.x, point.y + flare * 0.75)
-            ctx.stroke()
+          // diffraction spikes, drawn from one baked sprite instead of two gradients
+          if (weight > 6.5 && radius > 3.4) {
+            const flare = radius * (4.2 + Math.min(3.4, weight * 0.28))
+            ctx.globalAlpha = Math.min(0.7, alpha * 0.5)
+            ctx.drawImage(spike, node.px - flare, node.py - flare * 0.78, flare * 2, flare * 1.56)
           }
 
           if (node.meta?.live === true && node.meta.hasMemory === false) {
@@ -1491,7 +1703,7 @@ window.__ModuleLoader__.load({
             ctx.strokeStyle = style.ring
             ctx.lineWidth = 1
             ctx.beginPath()
-            ctx.arc(point.x, point.y, radius * 2.1 + 3, 0, Math.PI * 2)
+            ctx.arc(node.px, node.py, radius * 2.1 + 3, 0, Math.PI * 2)
             ctx.stroke()
           }
 
@@ -1500,7 +1712,7 @@ window.__ModuleLoader__.load({
             ctx.strokeStyle = '#ffe29a'
             ctx.lineWidth = 1.1
             ctx.beginPath()
-            ctx.arc(point.x, point.y, radius * 1.9 + 5, 0, Math.PI * 2)
+            ctx.arc(node.px, node.py, radius * 1.9 + 5, 0, Math.PI * 2)
             ctx.stroke()
           }
           if (node === this.selected || node === this.locked) {
@@ -1508,7 +1720,7 @@ window.__ModuleLoader__.load({
             ctx.strokeStyle = style.ring
             ctx.lineWidth = 1.2
             ctx.beginPath()
-            ctx.arc(point.x, point.y, radius * 2.6 + 6, 0, Math.PI * 2)
+            ctx.arc(node.px, node.py, radius * 2.6 + 6, 0, Math.PI * 2)
             ctx.stroke()
           }
         }
@@ -1543,9 +1755,13 @@ window.__ModuleLoader__.load({
 
         // labels, nearest first, with collision avoidance
         const labelled = new Set()
-        const candidates = [...this.nodes]
-          .filter((node) => projected.has(node.id) && node.kind !== 'file' && node.kind !== 'session')
-          .sort((a, b) => (b.weight ?? 0) - (a.weight ?? 0) || projected.get(a.id).depth - projected.get(b.id).depth)
+        const candidates = this.labelBuf ?? (this.labelBuf = [])
+        candidates.length = 0
+        for (const node of this.nodes) {
+          if (node.pv === 0 || node.kind === 'file' || node.kind === 'session') continue
+          candidates.push(node)
+        }
+        candidates.sort((a, b) => (b.weight ?? 0) - (a.weight ?? 0) || a.pd - b.pd)
         const budget = Math.max(10, Math.min(30, Math.round((1100 / Math.max(0.6, 1500 / dist)) * 0.55)))
         for (const node of candidates) {
           if (labelled.size >= budget) break
@@ -1565,21 +1781,21 @@ window.__ModuleLoader__.load({
         ctx.textBaseline = 'middle'
         for (const node of order) {
           if (!labelled.has(node.id)) continue
-          const point = projected.get(node.id)
-          if (point.x < 40 || point.y < 20 || point.x > width - 40 || point.y > height - 20) continue
+          const point = node
+          if (node.px < 40 || node.py < 20 || node.px > width - 40 || node.py > height - 20) continue
           const style = KIND_STYLE[node.kind] ?? KIND_STYLE.document
-          const fog = Math.min(0.9, Math.max(0, (point.depth - dist * 0.6) / (dist * 1.5)))
+          const fog = Math.min(0.9, Math.max(0, (node.pd - dist * 0.6) / (dist * 1.5)))
           if (focus !== undefined && !this.highlight.has(node.id) && node.id !== focus.id) continue
-          const size = Math.max(9, Math.min(14, 9.5 + (node.weight ?? 1) * 0.5) * Math.min(1.15, Math.max(0.85, 1400 / point.depth)))
+          const size = Math.max(9, Math.min(14, 9.5 + (node.weight ?? 1) * 0.5) * Math.min(1.15, Math.max(0.85, 1400 / node.pd)))
           ctx.font = `${node.kind === 'document' ? 500 : 400} ${size}px ${FONT_STACK}`
           const text = node.label.length > 26 ? node.label.slice(0, 25) + '…' : node.label
           const textWidth = ctx.measureText(text).width
-          const baseY = point.y + Math.max(9, Math.min(40, this.radiusOf(node) * point.scale)) + 8
+          const baseY = point.py + Math.max(9, Math.min(40, this.radiusOf(node) * point.pv)) + 8
           const pinned = focus !== undefined && (node.id === focus.id || this.highlight.has(node.id))
           let placedY
           for (const offset of [0, 15, -15, 30]) {
             const candidate = baseY + offset
-            const rect = { x1: point.x - textWidth / 2 - 3, x2: point.x + textWidth / 2 + 3, y1: candidate - 7, y2: candidate + 7 }
+            const rect = { x1: point.px - textWidth / 2 - 3, x2: point.px + textWidth / 2 + 3, y1: candidate - 7, y2: candidate + 7 }
             if (pinned || !collides(rect)) {
               placed.push(rect)
               placedY = candidate
@@ -1587,19 +1803,19 @@ window.__ModuleLoader__.load({
             }
           }
           if (placedY === undefined) continue
-          const anchorY = point.y + Math.max(7, Math.min(40, this.radiusOf(node) * point.scale))
+          const anchorY = point.py + Math.max(7, Math.min(40, this.radiusOf(node) * point.pv))
           if (placedY - anchorY > 11) {
             ctx.globalAlpha = (focus === undefined ? 0.3 : 0.45) * (1 - fog)
             ctx.strokeStyle = hexToRgba(style.ring, 0.55)
             ctx.lineWidth = 0.7
             ctx.beginPath()
-            ctx.moveTo(point.x, anchorY)
-            ctx.lineTo(point.x, placedY - 7)
+            ctx.moveTo(point.px, anchorY)
+            ctx.lineTo(point.px, placedY - 7)
             ctx.stroke()
           }
           ctx.globalAlpha = (focus === undefined ? 0.84 : 0.98) * (1 - fog * 0.75)
           ctx.fillStyle = node.kind === 'document' ? '#eaf6ff' : style.ring
-          ctx.fillText(text, point.x, placedY)
+          ctx.fillText(text, point.px, placedY)
         }
         ctx.globalAlpha = 1
 
@@ -1657,14 +1873,14 @@ window.__ModuleLoader__.load({
         // hover tooltip
         const tip = this.selected === undefined ? this.hovered : undefined
         if (tip !== undefined && this.pointer.inside) {
-          const point = projected.get(tip.id)
+          const point = tip.pv === 0 ? undefined : tip
           if (point !== undefined) {
             const style = KIND_STYLE[tip.kind] ?? KIND_STYLE.document
             const text = tip.label.length > 32 ? tip.label.slice(0, 31) + '…' : tip.label
             ctx.font = `500 12px ${FONT_STACK}`
             const boxWidth = Math.min(320, ctx.measureText(text).width + 38)
-            const x = Math.min(width - boxWidth - 10, Math.max(10, point.x + 16))
-            const y = Math.min(height - 36, Math.max(10, point.y - 32))
+            const x = Math.min(width - boxWidth - 10, Math.max(10, point.px + 16))
+            const y = Math.min(height - 36, Math.max(10, point.py - 32))
             ctx.globalAlpha = 0.97
             ctx.beginPath()
             if (typeof ctx.roundRect === 'function') ctx.roundRect(x, y, boxWidth, 27, 8)
