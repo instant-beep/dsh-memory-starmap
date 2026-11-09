@@ -48,6 +48,7 @@ window.__ModuleLoader__.load({
       'action.search': '搜索记忆、技能、文件…',
       'action.clear': '清除选择',
       'layout.force': '引力场',
+      'layout.heart': '爱心',
       'layout.orbital': '星系',
       'layout.cluster': '星团',
       'layout.layers': '地层',
@@ -117,6 +118,7 @@ window.__ModuleLoader__.load({
       'action.search': 'Search memories, skills, files…',
       'action.clear': 'Clear selection',
       'layout.force': 'Field',
+      'layout.heart': 'Heart',
       'layout.orbital': 'Galaxy',
       'layout.cluster': 'Clusters',
       'layout.layers': 'Strata',
@@ -266,6 +268,55 @@ window.__ModuleLoader__.load({
      * orbits the focus point on a sphere, so depth is `dist - z2` after the two
      * view rotations.
      */
+    /**
+     * The classic heart curve: two full lobes on top, a sharp tip below. Taken
+     * into 3D by shrinking copies of the outline into layers and bulging each
+     * layer along z, so the map keeps a readable heart silhouette from the front
+     * and gains real volume when the camera orbits.
+     */
+    function heartOutline(t) {
+      const s = Math.sin(t)
+      const x = (16 * s * s * s) / 16
+      const y = (13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t)) / 17
+      return [x, y]
+    }
+
+    /** Centre of the curve's bounding box on y, so the heart sits on its middle. */
+    const HEART_Y_OFFSET = 0.145
+    /** How far the layers bulge towards the viewer. */
+    const HEART_DEPTH = 0.62
+
+    /** Even spacing along the curve: parameter steps bunch up near the tip. */
+    const HEART_ARC = (() => {
+      const steps = 512
+      const points = []
+      for (let index = 0; index <= steps; index += 1) points.push(heartOutline((index / steps) * Math.PI * 2))
+      const lengths = [0]
+      for (let index = 1; index <= steps; index += 1) {
+        const [ax, ay] = points[index - 1]
+        const [bx, by] = points[index]
+        lengths.push(lengths[index - 1] + Math.hypot(bx - ax, by - ay))
+      }
+      const total = lengths[steps]
+      // arc position (0..1) -> curve parameter
+      const table = []
+      let cursor = 0
+      for (let index = 0; index <= 720; index += 1) {
+        const target = (index / 720) * total
+        while (cursor < steps - 1 && lengths[cursor + 1] < target) cursor += 1
+        const span = lengths[cursor + 1] - lengths[cursor] || 1
+        const local = (target - lengths[cursor]) / span
+        table.push(((cursor + local) / steps) * Math.PI * 2)
+      }
+      return table
+    })()
+
+    /** Point at a fraction of the way around the outline. */
+    function heartAt(fraction) {
+      const index = Math.min(720, Math.max(0, Math.round(fraction * 720)))
+      return heartOutline(HEART_ARC[index])
+    }
+
     class Camera {
       constructor() {
         this.yaw = 0.7
@@ -381,7 +432,7 @@ window.__ModuleLoader__.load({
         this.highlight = new Set()
         this.path = undefined
         this.pinch = undefined
-        this.layout = 'force'
+        this.layout = 'heart'
         this.rangeDays = 0
         this.playhead = 1
         this.playing = false
@@ -713,6 +764,35 @@ window.__ModuleLoader__.load({
         const spread = clusterSpread(count)
         for (const node of this.nodes) node.ly = undefined
 
+        if (this.layout === 'heart') {
+          // Nothing is scattered: every star sits on a shrunken copy of the heart
+          // curve, and the copy's depth bulge gives the shape its body. Weight
+          // decides the layer, so the memories that matter trace the outline.
+          const scale = Math.max(300, spread * 0.5)
+          const total = this.nodes.length
+          // the heaviest 38% trace the silhouette, the rest fill the volume behind it
+          const outlineCount = Math.max(12, Math.round(total * 0.38))
+          this.nodes.forEach((node, index) => {
+            const rank = total > 1 ? (node.spriteRank ?? 0) / (total - 1) : 0
+            const random = pseudoRandom(hashCode('h' + node.id))
+            // scatter along the curve by id, never by iteration order: reading
+            // order would sort whole kinds into coloured bands
+            const pour = random()
+            const [ux, uy] = heartAt(pour)
+            const onOutline = (node.spriteRank ?? 0) < outlineCount
+            const shell = onOutline
+              ? 0.94 + random() * 0.06
+              : 0.08 + random() * 0.84
+            const radius = shell * (0.99 + random() * 0.02)
+            const side = random() < 0.5 ? 1 : -1
+            const bulge = Math.sqrt(Math.max(0, 1 - radius * radius)) * HEART_DEPTH
+            node.tx = ux * radius * scale
+            node.ty = (uy + HEART_Y_OFFSET) * radius * scale
+            node.tz = side * bulge * scale
+          })
+          return
+        }
+
         if (this.layout === 'layers') {
           // memory strata: skills float on top, source files sink to the floor
           const heights = { space: 720, insight: 640, skill: 470, document: 160, runtime: -70, session: -320, file: -490 }
@@ -962,6 +1042,18 @@ window.__ModuleLoader__.load({
         ctx.globalAlpha = 1
       }
 
+      /**
+       * A real heartbeat is two pulses, a strong one and a softer echo. Scaled to
+       * the current motion preference, this drives the whole heart's breathing.
+       */
+      heartBeat() {
+        if (this.layout !== 'heart' || this.reducedMotion) return 1
+        const phase = (this.time / 1000) % 1.05
+        const lub = Math.exp(-Math.pow((phase - 0.14) / 0.075, 2))
+        const dub = Math.exp(-Math.pow((phase - 0.33) / 0.1, 2)) * 0.55
+        return 1 + 0.027 * (lub + dub)
+      }
+
       /** Sprite budget for the current quality tier. */
       spriteBudget() {
         const total = this.nodes.length
@@ -1057,11 +1149,12 @@ window.__ModuleLoader__.load({
 
       /** Screen-space hit test biased toward the nearest star. */
       pick(screenX, screenY) {
+        const beat = this.beat ?? 1
         let best
         let bestScore = Infinity
         for (const node of this.nodes) {
           if (!this.lodVisible(node)) continue
-          const point = this.view.project(node.x, node.y, node.z, this.size.width, this.size.height)
+          const point = this.view.project(node.x * beat, node.y * beat, node.z * beat, this.size.width, this.size.height)
           if (point === null) continue
           const radius = Math.max(9, this.radiusOf(node) * point.scale * 1.1)
           const dx = point.x - screenX
@@ -1201,9 +1294,10 @@ window.__ModuleLoader__.load({
           if (!this.simVisible(node)) continue
           const orphan = node.meta?.live === true && node.meta?.hasMemory === false
           if (node.tx !== undefined) {
-            node.vx += (node.tx - node.x) * 0.03 * alpha
-            node.vy += (node.ty - node.y) * 0.03 * alpha
-            node.vz += (node.tz - node.z) * 0.03 * alpha
+            const hold = this.layout === 'heart' ? 0.075 : 0.03
+            node.vx += (node.tx - node.x) * hold * alpha
+            node.vy += (node.ty - node.y) * hold * alpha
+            node.vz += (node.tz - node.z) * hold * alpha
           } else if (this.layout === 'force' && orphan) {
             const hash = hashCode(node.id)
             const angle = ((hash % 1000) / 1000) * Math.PI * 2
@@ -1562,6 +1656,58 @@ window.__ModuleLoader__.load({
           }
         }
 
+        // the heart's own body: a glowing outline plus a soft interior wash,
+        // baked once into the sky layer instead of a cloud of overlapping blobs
+        if (this.layout === 'heart') {
+          const scale = Math.max(300, clusterSpread(this.nodes.length) * 0.5)
+          const trace = (radius, depth) => {
+            ctx.beginPath()
+            let started = false
+            for (let index = 0; index <= 192; index += 1) {
+              const [ux, uy] = heartAt(index / 192)
+              const point = project(ux * radius * scale, (uy + HEART_Y_OFFSET) * radius * scale, depth)
+              if (point === null) {
+                started = false
+                continue
+              }
+              if (!started) {
+                ctx.moveTo(point.x, point.y)
+                started = true
+              } else {
+                ctx.lineTo(point.x, point.y)
+              }
+            }
+            ctx.closePath()
+            ctx.stroke()
+          }
+          // nested copies of the outline at different depths read as the heart's
+          // contour lines, so the body stays legible while the camera orbits
+          const layers = [[-0.88, 0.48], [-0.5, 0.82], [0, 1], [0.5, 0.82], [0.88, 0.48]]
+          for (const [level, radius] of layers) {
+            const fade = 1 - Math.abs(level) * 0.5
+            const depth = level * HEART_DEPTH * scale
+            for (const [width, alpha] of [[14, 0.05], [5.5, 0.11], [2, 0.42]]) {
+              ctx.lineWidth = (width * scale) / 320
+              ctx.strokeStyle = 'rgba(255,124,172,' + (alpha * fade).toFixed(3) + ')'
+              trace(radius, depth)
+            }
+          }
+          // an outer bloom just past the silhouette: the heart reads as lit, not drawn
+          for (const [width, alpha] of [[34, 0.04], [20, 0.055]]) {
+            ctx.lineWidth = (width * scale) / 320
+            ctx.strokeStyle = 'rgba(255,86,140,' + alpha + ')'
+            trace(1.045, 0)
+          }
+          // interior wash: a wide, very faint fill so the heart has a body
+          const core = project(0, HEART_Y_OFFSET * scale * 0.5, 0)
+          if (core !== null) {
+            const wash = Math.max(60, scale * 1.2 * core.scale * 0.5)
+            ctx.globalAlpha = 0.3
+            ctx.drawImage(this.glowSprite('255,86,140'), core.x - wash, core.y - wash, wash * 2, wash * 2)
+            ctx.globalAlpha = 1
+          }
+        }
+
         // nebulae wrap the real document clusters
         for (const cloud of this.nebulae) {
           const point = project(cloud.x, cloud.y, cloud.z)
@@ -1642,6 +1788,7 @@ window.__ModuleLoader__.load({
         }
         this.camera.zoom = 1500 / this.view.dist
         this.view.sync()
+        this.beat = this.heartBeat()
 
         // an idle map still breathes, but there is no reason to burn a full frame
         // budget on it: painters only run while something is actually moving
@@ -1707,10 +1854,11 @@ window.__ModuleLoader__.load({
 
         // project once into numeric fields: no Map, no per-frame objects
         const probe = this.probe
+        const beat = this.beat ?? 1
         for (const node of this.nodes) {
           node.pv = 0
           if (!this.lodVisible(node)) continue
-          this.view.into(probe, node.x, node.y, node.z, width, height)
+          this.view.into(probe, node.x * beat, node.y * beat, node.z * beat, width, height)
           if (!probe.ok) continue
           node.px = probe.x
           node.py = probe.y
@@ -1849,7 +1997,7 @@ window.__ModuleLoader__.load({
           }
           ctx.drawImage(warm ? node.spriteW : node.spriteC, node.px - halo / 2, node.py - halo / 2, halo, halo)
 
-          if (radius > 9) {
+          if (radius > 15) {
             // only the largest stars keep a hard core: at this size the sprite
             // alone reads soft, and these are a handful of nodes
             ctx.fillStyle = style.core
@@ -2313,7 +2461,7 @@ window.__ModuleLoader__.load({
       const canvasRef = React.useRef(null)
       const mapRef = React.useRef(undefined)
       const [selection, setSelection] = React.useState(undefined)
-      const [layout, setLayout] = React.useState('force')
+      const [layout, setLayout] = React.useState('heart')
       const [range, setRange] = React.useState(0)
       const [query, setQuery] = React.useState('')
       const [hidden, setHidden] = React.useState(() => new Set())
@@ -2528,7 +2676,7 @@ window.__ModuleLoader__.load({
         h(
           'div',
           { className: 'dsh-msm-bar', key: 'bar' },
-          ['force', 'orbital', 'cluster', 'layers'].map((id) =>
+          ['heart', 'force', 'orbital', 'cluster', 'layers'].map((id) =>
             h('button', {
               key: id,
               className: 'dsh-msm-btn',

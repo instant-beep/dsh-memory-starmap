@@ -16,3 +16,4 @@ dist/
 Thumbs.db
 .idea/
 .vscode/
+test/heart-layout.json

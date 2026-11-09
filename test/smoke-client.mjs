@@ -371,6 +371,35 @@ map.onWheel({ preventDefault: () => {}, offsetX: 600, offsetY: 400, deltaY: -220
 flush(20)
 console.log('camera after orbit/zoom: yaw', map.view.yaw.toFixed(2), 'pitch', map.view.pitch.toFixed(2), 'dist', Math.round(map.view.dist))
 console.log('projection sanity:', JSON.stringify(map.view.project(0, 0, 0, 1280, 760)), 'near', JSON.stringify(map.view.project(0, 0, 800, 1280, 760)))
+// ---- heart layout -------------------------------------------------------
+// The shape is the deliverable, so assert the silhouette: a tip near x = 0 at the
+// bottom, two lobes at the top, and real depth so orbiting does not flatten it.
+{
+  const engine = findEngine()
+  engine.setLayout('heart')
+  for (let step = 0; step < 80; step += 1) flush(1)
+  const nodes = engine.nodes
+  const ys = nodes.map((node) => node.ty)
+  const minY = Math.min(...ys)
+  const maxY = Math.max(...ys)
+  const tipBand = nodes.filter((node) => node.ty < minY + (maxY - minY) * 0.06)
+  const tipX = tipBand.reduce((total, node) => total + Math.abs(node.tx), 0) / Math.max(1, tipBand.length)
+  const width = maxY - minY
+  const topBand = nodes.filter((node) => node.ty > maxY - width * 0.18)
+  const leftLobe = topBand.filter((node) => node.tx < 0).length
+  const rightLobe = topBand.filter((node) => node.tx > 0).length
+  const zs = nodes.map((node) => Math.abs(node.tz))
+  const depth = Math.max(...zs)
+  const spanX = Math.max(...nodes.map((node) => node.tx)) - Math.min(...nodes.map((node) => node.tx))
+  console.log(`heart: tip |x| ${tipX.toFixed(0)} (span ${spanX.toFixed(0)}), lobes ${leftLobe}/${rightLobe}, depth ±${depth.toFixed(0)}, height ${width.toFixed(0)}`)
+  if (!(tipX < spanX * 0.09)) throw new Error('the heart has no tip: bottom band is not centred')
+  if (leftLobe < 3 || rightLobe < 3) throw new Error('the heart has no two lobes at the top')
+  if (!(depth > width * 0.25)) throw new Error('the heart is flat: no depth to orbit around')
+  if (!(spanX > width * 0.8 && spanX < width * 1.4)) throw new Error(`heart proportions off: width ${spanX} vs height ${width}`)
+  engine.setLayout('heart')
+  for (let step = 0; step < 20; step += 1) flush(1)
+}
+
 // ---- quality tiers ------------------------------------------------------
 // On a slow or software-rendered GPU the faint majority drops to batched rects.
 {
@@ -450,8 +479,15 @@ if (counting) {
   for (const name of callCounts.keys()) callCounts.set(name, 0)
   const before = process.memoryUsage().heapUsed
   const started = process.hrtime.bigint()
-  // steady state only: the first frames legitimately include warmup and uploads
-  for (let step = 0; step < 40; step += 1) flush(1)
+  // steady state only: drain the deferred warmup, then measure a calm map
+  const engineForBench = findEngine()
+  let guard = 0
+  while ((engineForBench.warmBudget ?? 0) > 0 && guard < 400) {
+    flush(1)
+    guard += 1
+  }
+  for (let step = 0; step < 60; step += 1) flush(1)
+  // keep the map warm enough to keep painting: alpha near zero short-circuits the loop
   for (const name of callCounts.keys()) callCounts.set(name, 0)
   const FRAMES = 240
   const frameTimes = []
