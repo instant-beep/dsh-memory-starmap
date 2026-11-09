@@ -400,6 +400,10 @@ window.__ModuleLoader__.load({
         this.dust = []
         this.nebulae = []
         this.edgeBuf = []
+        this.quality = 1
+        this.frameSamples = []
+        this.paintCount = 0
+        this.settlingFrames = 46
         this.nodeBuf = []
         this.probe = { ok: false, x: 0, y: 0, depth: 0, scale: 1 }
         this.dirty = true
@@ -584,6 +588,36 @@ window.__ModuleLoader__.load({
 
       // -- data -----------------------------------------------------------
       setGraph(graph) {
+        // Same star field, different titles: patch in place and leave the camera,
+        // the layout and the baked sky untouched. Rebuilding here used to cost a
+        // full warmup every time the workspace store ticked.
+        if (this.nodes.length === graph.nodes.length && this.nodes.length > 0) {
+          let same = true
+          for (let index = 0; index < graph.nodes.length; index += 1) {
+            if (this.nodes[index].id !== graph.nodes[index].id) {
+              same = false
+              break
+            }
+          }
+          if (same) {
+            for (let index = 0; index < graph.nodes.length; index += 1) {
+              const node = this.nodes[index]
+              const next = graph.nodes[index]
+              if (next.label !== node.label) {
+                node.label = next.label
+                this.dirty = true
+              }
+              if (next.sub !== node.sub) node.sub = next.sub
+              if (next.ts !== node.ts) node.ts = next.ts
+              if (next.weight !== node.weight) node.weight = next.weight
+              node.meta = next.meta ?? {}
+            }
+            this.rawGraph = graph
+            this.dirty = true
+            return
+          }
+        }
+
         const previous = new Map(this.nodes.map((node) => [node.id, node]))
         const spread = clusterSpread(graph.nodes.length)
         this.nodes = graph.nodes.map((node) => {
@@ -615,6 +649,9 @@ window.__ModuleLoader__.load({
           this.adjacency.get(edge.target.id).push(edge)
         }
         this.degree = new Map(this.nodes.map((node) => [node.id, this.adjacency.get(node.id).length]))
+        // sprite priority: the halo budget is spent on the heaviest stars first
+        const byWeight = this.nodes.slice().sort((a, b) => (b.weight ?? 1) - (a.weight ?? 1))
+        for (let index = 0; index < byWeight.length; index += 1) byWeight[index].spriteRank = index
         // per-edge drawing constants: hashing per frame was pure waste
         for (const edge of this.edges) {
           edge.bendFactor = edge.kind === 'semantic' ? 0.24 : edge.kind === 'skill' ? 0.17 : 0.075
@@ -649,8 +686,7 @@ window.__ModuleLoader__.load({
         this.needsFit = true
         this.applyLayout()
         this.fit()
-        this.warmup(110)
-        this.fit()
+        this.warmup(this.nodes.length > 500 ? 46 : this.nodes.length > 260 ? 64 : 96)
       }
 
       setLayout(layout) {
@@ -659,9 +695,8 @@ window.__ModuleLoader__.load({
         this.applyLayout()
         this.alpha = 1
         this.needsFit = true
-        // switching views re-heats the physics: settle it before the user sees it
+        // switching views re-heats the physics; the loop settles it over a few frames
         this.warmup(52)
-        this.fit()
       }
 
       setRange(days) {
@@ -897,6 +932,80 @@ window.__ModuleLoader__.load({
       }
 
       // -- geometry -------------------------------------------------------
+      /** Reused per-kind rect bucket for the faint majority. */
+      dotBucket(kind) {
+        const buckets = this.dotBuckets ?? (this.dotBuckets = new Map())
+        let bucket = buckets.get(kind)
+        if (bucket === undefined) {
+          bucket = []
+          buckets.set(kind, bucket)
+        }
+        return bucket
+      }
+
+      /** Flush and draw every batched dot bucket. */
+      flushDots() {
+        const buckets = this.dotBuckets
+        if (buckets === undefined) return
+        const ctx = this.ctx
+        for (const [kind, list] of buckets) {
+          if (list.length === 0) continue
+          ctx.globalAlpha = 0.85
+          ctx.fillStyle = (KIND_STYLE[kind] ?? KIND_STYLE.document).ring
+          ctx.beginPath()
+          for (let index = 0; index < list.length; index += 4) {
+            ctx.rect(list[index], list[index + 1], list[index + 2], list[index + 2])
+          }
+          ctx.fill()
+          list.length = 0
+        }
+        ctx.globalAlpha = 1
+      }
+
+      /** Sprite budget for the current quality tier. */
+      spriteBudget() {
+        const total = this.nodes.length
+        if (this.quality >= 2) return total
+        if (this.quality === 1) return Math.max(60, Math.round(total * 0.55))
+        return Math.max(30, Math.round(total * 0.28))
+      }
+
+      /** Background scale for the current quality tier. */
+      skyScale(dragging) {
+        const base = this.quality >= 2 ? 0.58 : this.quality === 1 ? 0.5 : 0.4
+        return dragging ? base * 0.78 : base
+      }
+
+      /**
+       * Watch the real frame interval and pick a tier that fits this machine.
+       * Software-rendered or integrated GPUs drop to small dots for the faint
+       * majority and keep full halos on the stars that carry meaning.
+       */
+      adapt() {
+        const samples = this.frameSamples
+        if (samples === undefined || samples.length < 20) return
+        // ignore the frames right after mount: they include layout, fonts and
+        // texture uploads and would drag the tier down for no reason
+        if (this.settlingFrames > 0) {
+          this.settlingFrames -= 1
+          samples.length = 0
+          return
+        }
+        let sum = 0
+        for (const value of samples) sum += value
+        const mean = sum / samples.length
+        this.frameSamples.length = 0
+        if (mean > 26 && this.quality > 0) {
+          this.quality -= 1
+          this.dirty = true
+          this.bg = undefined
+        } else if (mean < 15 && this.quality < 2) {
+          this.quality += 1
+          this.dirty = true
+          this.bg = undefined
+        }
+      }
+
       radiusOf(node) {
         if (node.r0 !== undefined) return node.r0
         const style = KIND_STYLE[node.kind] ?? KIND_STYLE.document
@@ -980,18 +1089,31 @@ window.__ModuleLoader__.load({
        * a few dozen milliseconds instead.
        */
       warmup(iterations) {
-        const saved = this.alpha
-        this.warming = true
-        this.alpha = Math.max(saved, 0.9)
-        for (let index = 0; index < iterations; index += 1) {
-          this.step()
-          this.alpha = Math.max(0.02, this.alpha * 0.965)
-        }
-        this.warming = false
-        this.alpha = Math.min(saved, 0.09)
-        this.stepSkip = 0
-        this.bg = undefined
+        // Never block the frame that mounts the panel: hand the work to the loop.
+        this.warmupCount = (this.warmupCount ?? 0) + 1
+        this.warmBudget = Math.max(this.warmBudget ?? 0, iterations)
+        this.alpha = Math.max(this.alpha, 0.85)
         this.dirty = true
+      }
+
+      /** Spend a slice of the pending warmup inside one frame. */
+      spendWarmup(budget) {
+        if (this.warmBudget === undefined || this.warmBudget <= 0) return
+        this.warming = true
+        const slice = Math.min(budget, this.warmBudget)
+        for (let index = 0; index < slice; index += 1) {
+          this.step()
+          this.alpha = Math.max(0.03, this.alpha * 0.978)
+        }
+        this.warmBudget -= slice
+        this.warming = false
+        this.dirty = true
+        if (this.warmBudget <= 0) {
+          this.warmBudget = 0
+          this.alpha = Math.min(this.alpha, 0.12)
+          this.stepSkip = 0
+          this.fit()
+        }
       }
 
       step() {
@@ -1164,10 +1286,12 @@ window.__ModuleLoader__.load({
           ctx.fillRect(0, 0, width, height)
         }
 
+        // particles are 1-2px: a rect is indistinguishable from a circle there and
+        // avoids a path per speck
         const layers = [
-          { count: Math.round((width * height) / 5200), size: 0.65, alpha: 0.3 },
-          { count: Math.round((width * height) / 12000), size: 1.0, alpha: 0.46 },
-          { count: Math.round((width * height) / 34000), size: 1.6, alpha: 0.66 },
+          { count: Math.round((width * height) / 9000), size: 1, alpha: 0.26 },
+          { count: Math.round((width * height) / 26000), size: 1, alpha: 0.44 },
+          { count: Math.round((width * height) / 62000), size: 2, alpha: 0.62 },
         ]
         for (const layer of layers) {
           for (let index = 0; index < layer.count; index += 1) {
@@ -1175,9 +1299,7 @@ window.__ModuleLoader__.load({
             const y = random() * height
             const alpha = layer.alpha * (0.3 + random() * 0.7)
             ctx.fillStyle = `rgba(222,236,255,${alpha.toFixed(3)})`
-            ctx.beginPath()
-            ctx.arc(x, y, layer.size * (0.55 + random() * 0.9), 0, Math.PI * 2)
-            ctx.fill()
+            ctx.fillRect(x, y, layer.size, layer.size)
           }
         }
 
@@ -1225,15 +1347,42 @@ window.__ModuleLoader__.load({
         const ctx = canvas.getContext('2d')
         const gradient = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2)
         gradient.addColorStop(0, hexToRgba(style.core, 1))
-        gradient.addColorStop(0.1, hexToRgba(style.core, 0.92))
-        gradient.addColorStop(0.22, hexToRgba(style.ring, 0.75))
-        gradient.addColorStop(0.45, hexToRgba(style.halo, 0.3))
+        gradient.addColorStop(0.14, hexToRgba(style.core, 0.98))
+        gradient.addColorStop(0.2, hexToRgba(style.ring, 0.86))
+        gradient.addColorStop(0.42, hexToRgba(style.halo, 0.34))
         gradient.addColorStop(0.72, hexToRgba(style.halo, 0.07))
         gradient.addColorStop(1, hexToRgba(style.halo, 0))
         ctx.fillStyle = gradient
         ctx.fillRect(0, 0, size, size)
         this.sprites.set(key, canvas)
+        this.promote(key, canvas)
         return canvas
+      }
+
+      /**
+       * Swap a baked canvas for an ImageBitmap once the browser has decoded it.
+       * drawImage(canvas) may re-upload a texture per blit; drawImage(bitmap)
+       * stays on the GPU. The canvas remains in place until the swap lands.
+       */
+      promote(key, canvas) {
+        if (typeof createImageBitmap !== 'function') return
+        if (canvas.__promoting === true || canvas.__promoted === true) return
+        canvas.__promoting = true
+        createImageBitmap(canvas).then((bitmap) => {
+          canvas.__promoted = true
+          if (this.sprites.get(key) === canvas) this.sprites.set(key, bitmap)
+          if (this.glow.get(key) === canvas) this.glow.set(key, bitmap)
+          if (this.spike === canvas) this.spike = bitmap
+          // nodes cache the baked sprite directly: drop those caches so the swap lands
+          for (const node of this.nodes) {
+            node.spriteW = undefined
+            node.spriteC = undefined
+          }
+          this.bg = undefined
+          this.dirty = true
+        }).catch(() => {
+          canvas.__promoting = false
+        })
       }
 
       /** One baked radial glow per colour: building gradients per frame was the old bottleneck. */
@@ -1253,6 +1402,7 @@ window.__ModuleLoader__.load({
         ctx.fillStyle = gradient
         ctx.fillRect(0, 0, size, size)
         this.glow.set(rgb, canvas)
+        this.promote(rgb, canvas)
         return canvas
       }
 
@@ -1288,6 +1438,7 @@ window.__ModuleLoader__.load({
         draw(true, 0.9, 2)
         draw(false, 0.62, 1.6)
         this.spike = canvas
+        this.promote('spike', canvas)
         return canvas
       }
 
@@ -1304,14 +1455,14 @@ window.__ModuleLoader__.load({
         // coarse key on purpose: the sky is all soft glow, so rebuilding it every
         // five frames only costs time, never visible accuracy
         const key = [
-          width, height, this.dpr,
+          width, height, this.dpr, this.quality,
           this.view.yaw.toFixed(2), this.view.pitch.toFixed(2), Math.round(this.view.dist / 12),
           Math.round(centre.x / 24), Math.round(centre.y / 24), Math.round(centre.z / 24),
           Math.round(spin * 8),
         ].join('|')
         if (this.bg !== undefined && this.bg.key === key) return this.bg.canvas
 
-        const scale = this.drag !== undefined || this.pinch !== undefined ? 0.42 : 0.58
+        const scale = this.skyScale(this.drag !== undefined || this.pinch !== undefined)
         const cw = Math.max(1, Math.round(width * scale))
         const ch = Math.max(1, Math.round(height * scale))
         let canvas = this.bg?.canvas
@@ -1496,6 +1647,7 @@ window.__ModuleLoader__.load({
         // budget on it: painters only run while something is actually moving
         const moving = this.drag !== undefined
           || this.pinch !== undefined
+          || (this.warmBudget !== undefined && this.warmBudget > 0)
           || this.alpha > 0.004
           || this.playing
           || Math.abs(this.spinVelocity.yaw) > 0.00008
@@ -1507,6 +1659,12 @@ window.__ModuleLoader__.load({
         const breathing = !this.reducedMotion && this.selected === undefined
         if (!moving && !breathing && !this.dirty && timestamp - this.lastPaint < 120) return
         if (!moving && !this.dirty && timestamp - this.lastPaint < 42) return
+        if (this.lastPaint > 0) {
+          const samples = this.frameSamples ?? (this.frameSamples = [])
+          samples.push(timestamp - this.lastPaint)
+          if (samples.length >= 24) this.adapt()
+        }
+        this.paintCount = (this.paintCount ?? 0) + 1
         this.dirty = false
         this.lastPaint = timestamp
 
@@ -1515,7 +1673,10 @@ window.__ModuleLoader__.load({
           if (this.playhead >= 1) this.playing = false
         }
 
-        this.step()
+        // warmup is spread over frames: three extra physics steps cost a few
+        // milliseconds, where doing them all at once froze the panel for ~200ms
+        if (this.warmBudget !== undefined && this.warmBudget > 0) this.spendWarmup(3)
+        else this.step()
         if (this.needsFit && this.alpha < 0.13) {
           this.needsFit = false
           this.fit()
@@ -1658,6 +1819,7 @@ window.__ModuleLoader__.load({
 
         const spike = this.spikeSprite()
         for (const node of order) {
+          if (node.px < -60 || node.py < -60 || node.px > width + 60 || node.py > height + 60) continue
           const style = KIND_STYLE[node.kind] ?? KIND_STYLE.document
           const scale = node.pv
           const radius = Math.max(1.1, Math.min(34, this.radiusOf(node) * scale * 0.85))
@@ -1668,15 +1830,31 @@ window.__ModuleLoader__.load({
           if (alpha < 0.02) continue
           const age = this.playhead - node.born
           const flash = age >= 0 && age < 0.03 ? 1 - age / 0.03 : 0
-          const halo = radius * (node.kind === 'document' ? 3.7 : 3.2) * (1 + flash * 1.1)
+          const halo = radius * (node.kind === 'document' ? 3.1 : 2.7) * (1 + flash * 1.1)
           ctx.globalAlpha = Math.min(0.95, alpha * 0.74 * (1 + flash * 0.5))
+          const budget = this.spriteBudget()
+          if ((node.spriteRank ?? 0) >= budget) {
+            // outside the halo budget: one batched rect per kind instead of a blit
+            const dot = Math.max(1.4, radius * 0.9)
+            const bucket = this.dotBucket(node.kind)
+            bucket.push(node.px - dot / 2, node.py - dot / 2, dot, alpha)
+            continue
+          }
           const warm = node.pd < dist * 0.98
-          ctx.drawImage(this.spriteFor(node.kind, warm), node.px - halo / 2, node.py - halo / 2, halo, halo)
+          const sprite = warm ? node.spriteW : node.spriteC
+          if (sprite === undefined) {
+            const baked = this.spriteFor(node.kind, warm)
+            if (warm) node.spriteW = baked
+            else node.spriteC = baked
+          }
+          ctx.drawImage(warm ? node.spriteW : node.spriteC, node.px - halo / 2, node.py - halo / 2, halo, halo)
 
-          if (radius > 2.2) {
+          if (radius > 9) {
+            // only the largest stars keep a hard core: at this size the sprite
+            // alone reads soft, and these are a handful of nodes
             ctx.fillStyle = style.core
             ctx.beginPath()
-            ctx.arc(node.px, node.py, Math.max(1, radius * 0.42), 0, Math.PI * 2)
+            ctx.arc(node.px, node.py, radius * 0.32, 0, Math.PI * 2)
             ctx.fill()
           }
 
@@ -1724,8 +1902,7 @@ window.__ModuleLoader__.load({
             ctx.stroke()
           }
         }
-        ctx.globalAlpha = 1
-
+        this.flushDots()
         ctx.globalCompositeOperation = 'source-over'
         ctx.globalAlpha = 1
 
@@ -2176,12 +2353,20 @@ window.__ModuleLoader__.load({
 
       // standardProps from the slot owner: the Session list snapshot ({ ids, byId })
       const sessionList = typeof useSessions === 'function' ? useSessions((state) => state) : undefined
-      const liveSessions = React.useMemo(
-        () => readLiveSessions(sessionList, servicesRef.current?.workspaces),
-        [sessionList, sessionTick, graph],
-      )
+      const liveRef = React.useRef({ signature: '', value: [] })
+      const liveSessions = React.useMemo(() => {
+        const raw = readLiveSessions(sessionList, servicesRef.current?.workspaces)
+        let signature = ''
+        for (const item of raw) {
+          signature += item.id + '\u0001' + (item.title ?? '') + '\u0001' + (item.updatedAt ?? '') + '\u0001' + (item.uiArchived === true ? '1' : '0') + '\u0002'
+        }
+        // same content, same array: downstream memos and the engine effect stay quiet
+        if (liveRef.current.signature !== signature) liveRef.current = { signature, value: raw }
+        return liveRef.current.value
+      }, [sessionList, sessionTick, graph])
 
       /** Host graph plus every conversation the workspace store still knows. */
+      const mergedRef = React.useRef({ signature: '', value: undefined })
       const merged = React.useMemo(() => {
         if (graph === undefined) return undefined
         const known = new Set()
@@ -2204,7 +2389,10 @@ window.__ModuleLoader__.load({
           })
         }
         const sessions = nodes.filter((node) => node.kind === 'session').length
-        return { ...graph, nodes, stats: { ...graph.stats, nodes: nodes.length, sessions } }
+        const built = { ...graph, nodes, stats: { ...graph.stats, nodes: nodes.length, sessions } }
+        if (mergedRef.current.signature === liveRef.current.signature) return mergedRef.current.value
+        mergedRef.current = { signature: liveRef.current.signature, value: built }
+        return built
       }, [graph, liveSessions])
 
       React.useEffect(() => {

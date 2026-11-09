@@ -371,6 +371,78 @@ map.onWheel({ preventDefault: () => {}, offsetX: 600, offsetY: 400, deltaY: -220
 flush(20)
 console.log('camera after orbit/zoom: yaw', map.view.yaw.toFixed(2), 'pitch', map.view.pitch.toFixed(2), 'dist', Math.round(map.view.dist))
 console.log('projection sanity:', JSON.stringify(map.view.project(0, 0, 0, 1280, 760)), 'near', JSON.stringify(map.view.project(0, 0, 800, 1280, 760)))
+// ---- quality tiers ------------------------------------------------------
+// On a slow or software-rendered GPU the faint majority drops to batched rects.
+{
+  const engine = findEngine()
+  const sampleDraws = (quality) => {
+    engine.quality = quality
+    engine.bg = undefined
+    for (const name of callCounts.keys()) callCounts.set(name, 0)
+    flush(30)
+    return (callCounts.get('drawImage') ?? 0) / 30
+  }
+  const high = sampleDraws(2)
+  const low = sampleDraws(0)
+  console.log(`halo blits per frame: quality 2 = ${high.toFixed(1)}, quality 0 = ${low.toFixed(1)}`)
+  if (!(low < high * 0.75)) throw new Error(`quality 0 did not reduce blits (${low} vs ${high})`)
+  const framed = engine.skyScale(false)
+  engine.quality = 0
+  if (!(engine.skyScale(false) < framed || engine.quality === 0)) throw new Error('sky scale did not respond to the tier')
+  engine.quality = 2
+  engine.bg = undefined
+  flush(20)
+}
+
+// ---- mount cost ---------------------------------------------------------
+// Entering the panel must not block: the graph is adopted immediately and the
+// physics is paid over the following frames, not in one synchronous stall.
+{
+  const engine = findEngine()
+  const fresh = JSON.parse(JSON.stringify(fixture))
+  fresh.nodes = fresh.nodes.slice(0, fresh.nodes.length - 1)
+  fresh.edges = fresh.edges.filter((edge) => {
+    const alive = new Set(fresh.nodes.map((node) => node.id))
+    return alive.has(`doc:${edge.s}`) || alive.has(edge.s) ? alive.has(edge.s) && alive.has(edge.t) : true
+  })
+  const started = process.hrtime.bigint()
+  engine.setGraph(fresh)
+  const adoptMs = Number(process.hrtime.bigint() - started) / 1e6
+  const budget = engine.warmBudget ?? 0
+  console.log(`new graph adopted in ${adoptMs.toFixed(1)}ms, deferred warmup budget ${budget} steps`)
+  if (adoptMs > 40) throw new Error(`setGraph blocked for ${adoptMs.toFixed(1)}ms on a fresh shape`)
+  if (budget <= 0) throw new Error('warmup budget was not deferred to the loop')
+
+  // spend it the way real frames would, then re-adopt the real fixture
+  for (let step = 0; step < Math.ceil(budget / 3) + 4; step += 1) flush(1)
+  console.log('warmup budget after draining frames:', engine.warmBudget ?? 0)
+  if ((engine.warmBudget ?? 0) !== 0) throw new Error('the loop never finished the warmup budget')
+  engine.setGraph(JSON.parse(JSON.stringify(fixture)))
+  for (let step = 0; step < 40; step += 1) flush(1)
+}
+
+// ---- rebuild stability --------------------------------------------------
+// The workspace store ticks constantly. If a tick rebuilt the engine, every
+// tick would pay a full warmup; that was the freeze on entering the panel.
+{
+  const engine = findEngine()
+  if (engine === undefined) throw new Error('engine not found for the rebuild check')
+  const before = engine.warmupCount ?? 0
+  const sample = engine.nodes.slice(0, 5).map((node) => [node.id, node.x, node.y, node.z])
+  const clone = JSON.parse(JSON.stringify(fixture))
+  for (let round = 0; round < 6; round += 1) {
+    clone.nodes[0].label = `round ${round}`
+    clone.nodes[0].sub = `tick ${round}`
+    engine.setGraph(clone)
+  }
+  const after = engine.warmupCount ?? 0
+  const moved = engine.nodes.slice(0, 5).some((node, index) => node.x !== sample[index][1] || node.y !== sample[index][2] || node.z !== sample[index][3])
+  console.log(`setGraph x6 on the same shape: warmups ${before} -> ${after}, positions ${moved ? 'RESET (bad)' : 'kept'}, label now "${engine.nodes[0].label}"`)
+  if (after !== before) throw new Error('setGraph re-ran the warmup for an unchanged graph shape')
+  if (moved) throw new Error('setGraph reset node positions for an unchanged graph shape')
+  if (engine.nodes[0].label !== 'round 5') throw new Error('setGraph did not apply the new label')
+}
+
 // ---- frame budget -------------------------------------------------------
 // Costs that used to be per-frame work. Gradients must be zero: the sky and every
 // glow are baked once, so a frame is only blits plus path strokes.
@@ -378,6 +450,9 @@ if (counting) {
   for (const name of callCounts.keys()) callCounts.set(name, 0)
   const before = process.memoryUsage().heapUsed
   const started = process.hrtime.bigint()
+  // steady state only: the first frames legitimately include warmup and uploads
+  for (let step = 0; step < 40; step += 1) flush(1)
+  for (const name of callCounts.keys()) callCounts.set(name, 0)
   const FRAMES = 240
   const frameTimes = []
   for (let step = 0; step < FRAMES; step += 1) {
