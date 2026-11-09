@@ -371,6 +371,34 @@ map.onWheel({ preventDefault: () => {}, offsetX: 600, offsetY: 400, deltaY: -220
 flush(20)
 console.log('camera after orbit/zoom: yaw', map.view.yaw.toFixed(2), 'pitch', map.view.pitch.toFixed(2), 'dist', Math.round(map.view.dist))
 console.log('projection sanity:', JSON.stringify(map.view.project(0, 0, 0, 1280, 760)), 'near', JSON.stringify(map.view.project(0, 0, 800, 1280, 760)))
+// ---- the map animates on its own ----------------------------------------
+// A star map that only moves when the mouse moves is a still image. The camera
+// has to drift every frame, at full rate, with no idle throttling.
+{
+  const engine = findEngine()
+  engine.view.yaw = 0.7
+  engine.view.target.yaw = 0.7
+  engine.spinVelocity.yaw = 0
+  engine.drag = undefined
+  engine.selected = undefined
+  engine.pinch = undefined
+  flush(2)
+  const before = engine.view.yaw
+  const paintsBefore = engine.paintCount ?? 0
+  const skyBefore = engine.bgRebuilds ?? 0
+  flush(30)
+  const skyDuring = (engine.bgRebuilds ?? 0) - skyBefore
+  const after = engine.view.yaw
+  const paints = (engine.paintCount ?? 0) - paintsBefore
+  const drift = after - before
+  console.log(`auto drift: ${drift.toFixed(4)} rad over 30 frames, ${paints} paints, ${(drift / 0.48).toFixed(4)} rad/s`)
+  if (!(drift > 0.02)) throw new Error(`the camera does not drift on its own (${drift} rad)`)
+  if (paints < 28) throw new Error(`idle frames were skipped: ${paints} paints out of 30`)
+  // a slow drift must not rebuild the baked sky every frame
+  console.log(`sky rebuilds during the drift: ${skyDuring} over 30 frames`)
+  if (skyDuring > 6) throw new Error(`the baked sky was rebuilt ${skyDuring} times in 30 idle frames`)
+}
+
 // ---- heart layout -------------------------------------------------------
 // The shape is the deliverable, so assert the silhouette: a tip near x = 0 at the
 // bottom, two lobes at the top, and real depth so orbiting does not flatten it.

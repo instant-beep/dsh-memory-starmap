@@ -94,9 +94,6 @@ window.__ModuleLoader__.load({
       'detail.pathLength': '最短关联路径',
       'detail.pathHint': 'Shift + 点击另一颗星，看两者的最短关联链',
       'legend.trace': 'Shift+点击追路径',
-      'timeline.play': '回放',
-      'timeline.pause': '暂停',
-      'timeline.hint': '记忆生长',
       'detail.memory': '记忆档案',
       'detail.memoryYes': '已有（星图里的连线就是它）',
       'detail.memoryNo': '暂无（这段对话还没沉淀成档案）',
@@ -164,9 +161,6 @@ window.__ModuleLoader__.load({
       'detail.pathLength': 'Shortest path',
       'detail.pathHint': 'Shift-click another star to trace the shortest chain',
       'legend.trace': 'Shift-click to trace',
-      'timeline.play': 'Replay',
-      'timeline.pause': 'Pause',
-      'timeline.hint': 'memory growth',
       'detail.memory': 'memory',
       'detail.memoryYes': 'written',
       'detail.memoryNo': 'none yet',
@@ -413,6 +407,8 @@ window.__ModuleLoader__.load({
         this.ctx = canvas.getContext('2d')
         this.onSelect = options.onSelect
         this.onHover = options.onHover
+        // The scene is meant to be alive; this only gates the optional sparkle,
+        // never the drift or the heartbeat.
         this.reducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true
 
         this.nodes = []
@@ -526,6 +522,9 @@ window.__ModuleLoader__.load({
             moved: 0,
             trace: event.shiftKey === true,
           }
+          // dragging a star needs the position it started from; without this the
+          // node mode threw on the first pointer move
+          this.dragNodeStart = hit === undefined ? undefined : { x: hit.x, y: hit.y, z: hit.z }
           if (hit !== undefined) this.alpha = Math.max(this.alpha, 0.3)
           this.canvas.setPointerCapture?.(event.pointerId)
         }
@@ -552,10 +551,10 @@ window.__ModuleLoader__.load({
             const stepX = x - this.lastPointer.x
             const stepY = y - this.lastPointer.y
             this.lastPointer = { x, y, time: this.time }
-            this.view.target.yaw = this.drag.yaw + dx * 0.0055
-            this.view.target.pitch = Math.max(-1.24, Math.min(1.24, this.drag.pitch + dy * 0.0042))
-            this.spinVelocity.yaw = this.spinVelocity.yaw * 0.6 + stepX * 0.0055 * 0.4
-            this.spinVelocity.pitch = this.spinVelocity.pitch * 0.6 + stepY * 0.0042 * 0.4
+            this.view.target.yaw = this.drag.yaw + dx * 0.0098
+            this.view.target.pitch = Math.max(-1.24, Math.min(1.24, this.drag.pitch + dy * 0.0076))
+            this.spinVelocity.yaw = this.spinVelocity.yaw * 0.55 + stepX * 0.0098 * 0.45
+            this.spinVelocity.pitch = this.spinVelocity.pitch * 0.55 + stepY * 0.0076 * 0.45
             this.alpha = Math.max(this.alpha, 0.06)
             return
           }
@@ -584,8 +583,8 @@ window.__ModuleLoader__.load({
         }
         this.onWheel = (event) => {
           event.preventDefault()
-          const factor = Math.exp(event.deltaY * 0.0011)
-          this.view.target.dist = Math.max(320, Math.min(6000, this.view.target.dist * factor))
+          const factor = Math.exp(event.deltaY * 0.0018)
+          this.view.target.dist = Math.max(240, Math.min(7000, this.view.target.dist * factor))
         }
         this.onDoubleClick = (event) => {
           const hit = this.pick(event.offsetX, event.offsetY)
@@ -1047,7 +1046,7 @@ window.__ModuleLoader__.load({
        * the current motion preference, this drives the whole heart's breathing.
        */
       heartBeat() {
-        if (this.layout !== 'heart' || this.reducedMotion) return 1
+        if (this.layout !== 'heart') return 1
         const phase = (this.time / 1000) % 1.05
         const lub = Math.exp(-Math.pow((phase - 0.14) / 0.075, 2))
         const dub = Math.exp(-Math.pow((phase - 0.33) / 0.1, 2)) * 0.55
@@ -1107,7 +1106,7 @@ window.__ModuleLoader__.load({
         return value
       }
 
-      /** Filters that only affect drawing: layer toggles, recency window, timeline replay. */
+      /** Filters that only affect drawing: layer toggles and the recency window. */
       visible(node) {
         if (this.hiddenKinds.has(node.kind)) return false
         if (this.rangeDays > 0) {
@@ -1132,7 +1131,6 @@ window.__ModuleLoader__.load({
 
       setPlayhead(value) {
         this.playhead = Math.min(1, Math.max(0, value))
-        if (this.playhead < 1) this.playing = false
       }
 
       currentDate() {
@@ -1550,7 +1548,7 @@ window.__ModuleLoader__.load({
         // five frames only costs time, never visible accuracy
         const key = [
           width, height, this.dpr, this.quality,
-          this.view.yaw.toFixed(2), this.view.pitch.toFixed(2), Math.round(this.view.dist / 12),
+          Math.round(this.view.yaw * 18), Math.round(this.view.pitch * 18), Math.round(this.view.dist / 26),
           Math.round(centre.x / 24), Math.round(centre.y / 24), Math.round(centre.z / 24),
           Math.round(spin * 8),
         ].join('|')
@@ -1757,6 +1755,7 @@ window.__ModuleLoader__.load({
         ctx.globalCompositeOperation = 'source-over'
         ctx.globalAlpha = 1
         this.bg = { canvas, key }
+        this.bgRebuilds = (this.bgRebuilds ?? 0) + 1
         return canvas
       }
 
@@ -1768,44 +1767,35 @@ window.__ModuleLoader__.load({
         this.time = timestamp
 
         // camera easing
-        this.view.yaw += (this.view.target.yaw - this.view.yaw) * 0.12
-        this.view.pitch += (this.view.target.pitch - this.view.pitch) * 0.12
-        this.view.dist += (this.view.target.dist - this.view.dist) * 0.1
-        this.view.focus.x += (this.view.target.focus.x - this.view.focus.x) * 0.1
-        this.view.focus.y += (this.view.target.focus.y - this.view.focus.y) * 0.1
-        this.view.focus.z += (this.view.target.focus.z - this.view.focus.z) * 0.1
+        // tight easing: the camera lands where the hand is, without a rubber band
+        this.view.yaw += (this.view.target.yaw - this.view.yaw) * 0.24
+        this.view.pitch += (this.view.target.pitch - this.view.pitch) * 0.24
+        this.view.dist += (this.view.target.dist - this.view.dist) * 0.2
+        this.view.focus.x += (this.view.target.focus.x - this.view.focus.x) * 0.19
+        this.view.focus.y += (this.view.target.focus.y - this.view.focus.y) * 0.19
+        this.view.focus.z += (this.view.target.focus.z - this.view.focus.z) * 0.19
         if (this.drag === undefined) {
           if (Math.abs(this.spinVelocity.yaw) > 0.00006 || Math.abs(this.spinVelocity.pitch) > 0.00006) {
             this.view.target.yaw += this.spinVelocity.yaw
             this.view.target.pitch = Math.max(-1.24, Math.min(1.24, this.view.target.pitch + this.spinVelocity.pitch))
-            this.spinVelocity.yaw *= 0.93
-            this.spinVelocity.pitch *= 0.9
+            this.spinVelocity.yaw *= 0.955
+            this.spinVelocity.pitch *= 0.94
           }
         }
-        if (!this.reducedMotion && this.drag === undefined && this.selected === undefined && Math.abs(this.spinVelocity.yaw) < 0.00008) {
-          this.view.target.yaw += delta * 0.000012
-          this.view.yaw += delta * 0.000012
+        // The map is alive on its own. Slow, constant drift unless the pointer is
+        // down; focusing a star only slows it, never freezes the scene.
+        if (this.drag === undefined && this.pinch === undefined && Math.abs(this.spinVelocity.yaw) < 0.00012) {
+          const focusFactor = this.selected === undefined ? 1 : 0.35
+          const drift = delta * 0.000082 * focusFactor
+          this.view.target.yaw += drift
+          this.view.yaw += drift
         }
         this.camera.zoom = 1500 / this.view.dist
         this.view.sync()
         this.beat = this.heartBeat()
 
-        // an idle map still breathes, but there is no reason to burn a full frame
-        // budget on it: painters only run while something is actually moving
-        const moving = this.drag !== undefined
-          || this.pinch !== undefined
-          || (this.warmBudget !== undefined && this.warmBudget > 0)
-          || this.alpha > 0.004
-          || this.playing
-          || Math.abs(this.spinVelocity.yaw) > 0.00008
-          || Math.abs(this.spinVelocity.pitch) > 0.00008
-          || Math.abs(this.view.target.yaw - this.view.yaw) > 0.0004
-          || Math.abs(this.view.target.pitch - this.view.pitch) > 0.0004
-          || Math.abs(this.view.target.dist - this.view.dist) > 0.4
-          || Math.hypot(this.view.target.focus.x - this.view.focus.x, this.view.target.focus.y - this.view.focus.y, this.view.target.focus.z - this.view.focus.z) > 0.4
-        const breathing = !this.reducedMotion && this.selected === undefined
-        if (!moving && !breathing && !this.dirty && timestamp - this.lastPaint < 120) return
-        if (!moving && !this.dirty && timestamp - this.lastPaint < 42) return
+        // The scene drifts every frame, so there is nothing to skip: one paint per
+        // animation frame, always at full rate.
         if (this.lastPaint > 0) {
           const samples = this.frameSamples ?? (this.frameSamples = [])
           samples.push(timestamp - this.lastPaint)
@@ -1814,11 +1804,6 @@ window.__ModuleLoader__.load({
         this.paintCount = (this.paintCount ?? 0) + 1
         this.dirty = false
         this.lastPaint = timestamp
-
-        if (this.playing) {
-          this.playhead = Math.min(1, this.playhead + delta / 15000)
-          if (this.playhead >= 1) this.playing = false
-        }
 
         // warmup is spread over frames: three extra physics steps cost a few
         // milliseconds, where doing them all at once froze the panel for ~200ms
@@ -2382,9 +2367,6 @@ window.__ModuleLoader__.load({
   padding:7px 14px; border-radius:999px; font-size:12px; color:#dff4ff;
   background: rgba(20,40,70,.92); border:1px solid rgba(126,227,255,.4);
   box-shadow:0 6px 24px rgba(0,0,0,.45); backdrop-filter: blur(8px); pointer-events:none; }
-.dsh-msm-timeline { position:absolute; left:14px; right:330px; bottom:12px; display:flex; align-items:center; gap:10px;
-  padding:6px 10px; border-radius:10px; background: rgba(8,12,22,.6);
-  border:1px solid var(--dsw-alias-border-l1); backdrop-filter: blur(8px); }
 .dsh-msm-play { height:26px; padding:0 10px; font-size:11.5px; }
 .dsh-msm-btn.dsh-msm-primary { border-color: rgba(126,227,255,.55); color:#dff4ff;
   background: rgba(80,170,255,.14); }
@@ -2395,7 +2377,7 @@ window.__ModuleLoader__.load({
   background:#eaf6ff; box-shadow:0 0 10px rgba(126,227,255,.85); cursor:pointer; }
 .dsh-msm-date { font-size:11px; color: var(--dsw-alias-label-tertiary); min-width:74px; text-align:right;
   font-variant-numeric: tabular-nums; }
-.dsh-msm-foot { position:absolute; left:14px; bottom:54px; right:320px; display:flex; align-items:center; gap:12px;
+.dsh-msm-foot { position:absolute; left:14px; bottom:14px; right:320px; display:flex; align-items:center; gap:12px;
   font-size:11px; color: var(--dsw-alias-label-tertiary); pointer-events:none; flex-wrap:wrap; }
 .dsh-msm-stats { position:absolute; top:14px; left:14px; display:flex; gap:14px; font-size:11px;
   color: var(--dsw-alias-label-tertiary); pointer-events:none; flex-wrap:wrap; max-width:calc(100% - 340px); }
@@ -2467,25 +2449,10 @@ window.__ModuleLoader__.load({
       const [hidden, setHidden] = React.useState(() => new Set())
       const [searchHit, setSearchHit] = React.useState(undefined)
       const [sessionTick, setSessionTick] = React.useState(0)
-      const [clock, setClock] = React.useState({ playhead: 1, playing: false, date: undefined })
       const [navigateError, setNavigateError] = React.useState(undefined)
       const [note, setNote] = React.useState(undefined)
       const servicesRef = React.useRef(services)
       servicesRef.current = services
-
-      React.useEffect(() => {
-        const timer = setInterval(() => {
-          const map = mapRef.current
-          if (map === undefined) return
-          setClock((current) => {
-            const playing = map.playing
-            const playhead = map.playhead
-            if (Math.abs(current.playhead - playhead) < 0.0008 && current.playing === playing) return current
-            return { playhead, playing, date: map.currentDate() }
-          })
-        }, 180)
-        return () => clearInterval(timer)
-      }, [])
 
       React.useEffect(() => {
         const tick = () => setSessionTick((value) => value + 1)
@@ -2740,40 +2707,6 @@ window.__ModuleLoader__.load({
               setSelection(undefined)
             },
           }),
-          merged === undefined ? null : h('div', { className: 'dsh-msm-timeline' },
-            h('button', {
-              className: 'dsh-msm-btn dsh-msm-play',
-              type: 'button',
-              onClick: () => {
-                const map = mapRef.current
-                if (map === undefined) return
-                if (map.playing) map.playing = false
-                else {
-                  if (map.playhead >= 0.999) map.playhead = 0
-                  map.playing = true
-                }
-                setClock({ playhead: map.playhead, playing: map.playing, date: map.currentDate() })
-              },
-            }, clock.playing ? t('timeline.pause') : t('timeline.play')),
-            h('input', {
-              className: 'dsh-msm-range',
-              type: 'range',
-              min: 0,
-              max: 1000,
-              step: 1,
-              value: Math.round(clock.playhead * 1000),
-              'aria-label': t('timeline.hint'),
-              onChange: (event) => {
-                const value = Number(event.target.value) / 1000
-                const map = mapRef.current
-                if (map !== undefined) map.setPlayhead(value)
-                if (range !== 0) setRange(0)
-                setClock({ playhead: value, playing: false, date: map === undefined ? undefined : map.currentDate() })
-              },
-            }),
-            h('span', { className: 'dsh-msm-date' }, clock.date === undefined
-              ? '—'
-              : `${clock.date.getFullYear()}-${String(clock.date.getMonth() + 1).padStart(2, '0')}-${String(clock.date.getDate()).padStart(2, '0')}`)),
           h('div', { className: 'dsh-msm-foot' },
             liveCount > 0 ? h('span', { style: { color: 'rgba(180,156,255,.85)' } }, `${t('legend.live')} ${liveCount}`) : null,
             h('span', null, t('legend.hint')),
