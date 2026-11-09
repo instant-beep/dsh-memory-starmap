@@ -283,6 +283,14 @@ if (sessionNeighbours.length > 0 && exposed.relatedSessionId === undefined) thro
 const sessionStar = map.nodes.find((node) => node.kind === 'session' && typeof node.meta?.sessionId === 'string')
 console.log('session star addressable:', sessionStar === undefined ? 'none' : sessionStar.meta.sessionId.slice(0, 8))
 
+// handoff note: paste-ready markdown built from the live map
+const handoff = map.handoff(map.exposeNode(docStar))
+const handoffLines = handoff.split(String.fromCharCode(10))
+console.log('handoff:', handoffLines.length, 'lines /', handoff.length, 'bytes | head:', handoffLines[0])
+if (!handoff.includes('# 上下文交接')) throw new Error('handoff note has no heading')
+if (!handoff.includes('## 最近记忆')) throw new Error('handoff note has no memory section')
+if (handoffLines.length < 10) throw new Error('handoff note is too thin to be useful')
+
 // focus + selection path used by the card
 map.select(sample)
 console.log('highlight size:', map.highlight.size, '| degree:', map.degree.get(sample.id))

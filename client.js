@@ -41,6 +41,9 @@ window.__ModuleLoader__.load({
       'action.refresh': '重新测量星图',
       'action.reset': '复位视角',
       'action.latest': '最新记忆',
+      'action.handoff': '导出上下文',
+      'action.handoffDone': '已复制，粘到新会话开头即可接上',
+      'action.handoffFail': '复制失败，已下载为文件',
       'action.current': '聚焦此星',
       'action.search': '搜索记忆、技能、文件…',
       'action.clear': '清除选择',
@@ -107,6 +110,9 @@ window.__ModuleLoader__.load({
       'action.refresh': 'Re-measure the sky',
       'action.reset': 'Reset view',
       'action.latest': 'Latest memory',
+      'action.handoff': 'Export context',
+      'action.handoffDone': 'Copied — paste it at the top of a new conversation',
+      'action.handoffFail': 'Copy failed; downloaded as a file instead',
       'action.current': 'Focus star',
       'action.search': 'Search memories, skills, files…',
       'action.clear': 'Clear selection',
@@ -772,6 +778,11 @@ window.__ModuleLoader__.load({
       }
 
       /** Breadth-first shortest chain between two stars, over every relation kind. */
+      /** Paste-ready handoff note; see buildHandoff for the layout. */
+      handoff(detail, limit) {
+        return buildHandoff(this, detail, limit)
+      }
+
       findPath(from, to) {
         const previous = new Map([[from.id, undefined]])
         const queue = [from]
@@ -1826,6 +1837,10 @@ window.__ModuleLoader__.load({
 .dsh-msm-rel button:hover { background: var(--dsw-alias-interactive-bg-hover); color: var(--dsw-alias-label-primary); }
 .dsh-msm-rel span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .dsh-msm-rel em { font-style:normal; color: var(--dsw-alias-label-tertiary); font-size:10px; margin-left:auto; }
+.dsh-msm-toast { position:absolute; left:50%; top:14px; transform:translateX(-50%); z-index:3;
+  padding:7px 14px; border-radius:999px; font-size:12px; color:#dff4ff;
+  background: rgba(20,40,70,.92); border:1px solid rgba(126,227,255,.4);
+  box-shadow:0 6px 24px rgba(0,0,0,.45); backdrop-filter: blur(8px); pointer-events:none; }
 .dsh-msm-timeline { position:absolute; left:14px; right:330px; bottom:12px; display:flex; align-items:center; gap:10px;
   padding:6px 10px; border-radius:10px; background: rgba(8,12,22,.6);
   border:1px solid var(--dsw-alias-border-l1); backdrop-filter: blur(8px); }
@@ -1913,6 +1928,7 @@ window.__ModuleLoader__.load({
       const [sessionTick, setSessionTick] = React.useState(0)
       const [clock, setClock] = React.useState({ playhead: 1, playing: false, date: undefined })
       const [navigateError, setNavigateError] = React.useState(undefined)
+      const [note, setNote] = React.useState(undefined)
       const servicesRef = React.useRef(services)
       servicesRef.current = services
 
@@ -2076,6 +2092,33 @@ window.__ModuleLoader__.load({
               setSelection(map.exposeNode(latest))
             },
           }, t('action.latest')),
+          h('button', {
+            className: 'dsh-msm-btn dsh-msm-primary',
+            type: 'button',
+            onClick: () => {
+              const map = mapRef.current
+              if (map === undefined) return
+              const text = map.handoff(selection)
+              const download = () => {
+                try {
+                  const blob = new Blob([text], { type: 'text/markdown;charset=utf-8' })
+                  const url = URL.createObjectURL(blob)
+                  const anchor = document.createElement('a')
+                  anchor.href = url
+                  anchor.download = `dsh-handoff-${Date.now()}.md`
+                  anchor.click()
+                  setTimeout(() => URL.revokeObjectURL(url), 4000)
+                  setNote(t('action.handoffFail'))
+                } catch {
+                  setNote(t('action.handoffFail'))
+                }
+              }
+              if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText !== undefined) {
+                navigator.clipboard.writeText(text).then(() => setNote(t('action.handoffDone')), download)
+              } else download()
+              setTimeout(() => setNote(undefined), 4200)
+            },
+          }, t('action.handoff')),
           h('button', { className: 'dsh-msm-btn', type: 'button', onClick: () => { mapRef.current?.fit(); setQuery(''); mapRef.current?.select(undefined); setSelection(undefined) } }, t('action.reset')),
           h('button', { className: 'dsh-msm-btn', type: 'button', onClick: refresh }, t('action.refresh'))),
         h(
@@ -2114,6 +2157,7 @@ window.__ModuleLoader__.load({
           'div',
           { className: 'dsh-msm-stage', key: 'stage' },
           h('canvas', { ref: canvasRef, className: 'dsh-msm-canvas', tabIndex: 0, 'aria-label': t('page.title') }),
+          note === undefined ? null : h('div', { className: 'dsh-msm-toast' }, note),
           stats === undefined ? null : h('div', { className: 'dsh-msm-stats' },
             h('span', null, t('stats.nodes'), h('b', null, stats.nodes)),
             h('span', null, t('stats.edges'), h('b', null, stats.edges)),
@@ -2256,6 +2300,55 @@ window.__ModuleLoader__.load({
             ? h('button', { className: 'dsh-msm-btn dsh-msm-primary', type: 'button', onClick: () => onOpenSession(detail.relatedSessionId) }, t('detail.openSourceSession'))
             : null,
           h('button', { className: 'dsh-msm-btn', type: 'button', onClick: onClose }, t('action.clear'))))
+    }
+
+    /** A paste-ready handoff note: what this map knows, so a fresh conversation can reload it. */
+    function buildHandoff(map, detail, limit = 30) {
+      const pad = (value) => String(value).padStart(2, '0')
+      const now = new Date()
+      const stamp = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}`
+      const docs = map.nodes
+        .filter((node) => node.kind === 'document')
+        .sort((a, b) => String(b.seen ?? b.ts ?? '').localeCompare(String(a.seen ?? a.ts ?? '')))
+        .slice(0, limit)
+      const lives = map.nodes.filter((node) => node.meta?.live === true && node.meta.hasMemory === false)
+      const sessions = map.nodes.filter((node) => node.kind === 'session').length
+      const files = map.nodes.filter((node) => node.kind === 'file').length
+      const skills = map.nodes.filter((node) => node.kind === 'skill').length
+      const lines = []
+      lines.push(`# 上下文交接 · ${stamp}`)
+      lines.push('')
+      lines.push('> 由记忆星图导出。新会话里先读下面这些档案，就能接上之前的状态。')
+      lines.push('')
+      if (detail !== undefined) {
+        const meta = detail.node.meta ?? {}
+        lines.push('## 当前焦点')
+        lines.push(`- ${detail.node.label}`)
+        if (meta.relativePath !== undefined) lines.push(`- 档案：\`${meta.relativePath}\``)
+        if (detail.degree > 0) lines.push(`- 关联 ${detail.degree} 条`)
+        lines.push('')
+      }
+      lines.push(`## 最近记忆（${docs.length} 篇）`)
+      docs.forEach((node, index) => {
+        const meta = node.meta ?? {}
+        const when = String(meta.updatedAt ?? node.ts ?? node.seen ?? '').slice(0, 10)
+        const where = meta.relativePath ?? meta.path ?? meta.root ?? ''
+        lines.push(`${index + 1}. **${node.label}**${when === '' ? '' : ` — ${when}`}${where === '' ? '' : ` · \`${where}\``}`)
+        const summary = String(node.sub ?? '').replace(/\s+/gu, ' ').trim()
+        if (summary !== '') lines.push(`   > ${summary.slice(0, 160)}`)
+      })
+      lines.push('')
+      if (lives.length > 0) {
+        lines.push(`## 未归档对话（${lives.length} 段，记忆里没有，需要时再翻）`)
+        lives
+          .sort((a, b) => String(b.ts ?? '').localeCompare(String(a.ts ?? '')))
+          .slice(0, 15)
+          .forEach((node) => lines.push(`- ${node.label}（${String(node.meta?.sessionId ?? '').slice(0, 8)}）`))
+        lines.push('')
+      }
+      lines.push('## 图统计')
+      lines.push(`星点 ${map.nodes.length} · 连线 ${map.edges.length} · 档案 ${docs.length} · 会话 ${sessions} · 源码 ${files} · 技能 ${skills}`)
+      return lines.join(String.fromCharCode(10))
     }
 
     // ---------------------------------------------------------------------
